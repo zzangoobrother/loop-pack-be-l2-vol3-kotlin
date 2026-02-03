@@ -175,3 +175,72 @@ support/error/     → CoreException, ErrorType
 - 매 단계마다 전체 테스트를 실행한다 (장시간 테스트 제외)
 - 테스트 이름은 동작을 설명하도록 작성한다
 - 결함 수정 시: API 레벨 실패 테스트 → 최소 재현 테스트 → 둘 다 통과시키기
+
+## 브랜치 및 PR 규칙
+
+### 브랜치 생성
+
+- 기능 단위로 브랜치 생성
+- 브랜치 네이밍: `feature/week3-order-cancel`, `fix/week5-coupon-bugfix`, `feat/volume-1-user-tests`
+- 브랜치는 항상 `main` 기준으로 생성
+
+```bash
+git checkout main
+git pull origin main
+git checkout -b feat/volume-1-user-tests
+```
+
+### PR 생성 워크플로우
+
+```bash
+# 변경사항 커밋 후 원격에 푸시
+git push -u origin feat/volume-1-user-tests
+
+# gh CLI로 PR 생성
+gh pr create --title "[volume-1] 작업 내용 요약" --body-file .github/pull_request_template.md
+
+# 또는 대화형으로 PR 생성
+gh pr create
+```
+
+### 커밋 메시지
+
+- 명확한 동사 + 작업 대상 구조로 작성
+- 커밋 메시지만으로 어떤 작업인지 파악 가능하도록 작성
+- 예시:
+  - `feat: 주문 생성 기능 구현`
+  - `refactor: 장바구니 엔티티 리팩토링`
+  - `test: 주문 생성 테스트 코드 추가`
+
+### PR 제목 규칙
+
+- 형식: `[volume-n] 작업 내용 요약`
+  - 예: `[volume-1] 회원가입, 로그인 구현`
+
+### PR 작성 시 유의사항
+
+| 항목 | 설명 |
+| --- | --- |
+| ✅ 리뷰 포인트 필수 | PR 템플릿 내 `💬 리뷰 포인트`는 반드시 채워야 함 |
+| 🔍 불필요한 코드 제거 | 디버깅 로그(`println`), 사용하지 않는 클래스/메서드 제거 |
+| 🧪 테스트 커버리지 | 기능 구현 시 단위 테스트 또는 통합 테스트 포함 |
+| 💄 코드 스타일 | 기본 포맷팅, 컨벤션 준수 (ktlintFormat 활용) |
+
+### PR 템플릿
+
+```markdown
+## 📌 Summary
+- 어떤 기능/이슈를 해결했는지 요약
+
+## 💬 리뷰 포인트
+- 리뷰어가 중점적으로 봐줬으면 하는 부분 (3개 이내)
+- 고민했던 설계 포인트나 로직
+
+## ✅ Checklist
+- [ ] 테스트 코드 포함
+- [ ] 불필요한 코드 제거
+- [ ] README or 주석 보강 (필요 시)
+
+## 📎 기타 참고 사항
+- 관련 커밋, 이슈, 참고 링크 등
+```
