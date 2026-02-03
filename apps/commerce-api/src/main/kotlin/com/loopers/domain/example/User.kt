@@ -33,20 +33,46 @@ class User(
         protected set
 
     init {
-        if (loginId.isBlank()) throw CoreException(ErrorType.BAD_REQUEST, "로그인 ID는 비어있을 수 없습니다.")
+        validateLoginId(loginId)
+        validatePassword(password, birthday)
+        validateName(name)
+        validateEmail(email)
+    }
 
-        val loginIdPattern = Regex(".*([가-힣]|[!@#$%^&*(),.?\":{}|<>]).*")
-        if (loginIdPattern.containsMatchIn(loginId)) throw CoreException(ErrorType.BAD_REQUEST, "로그인 ID를 확인 해주세요.")
+    private fun validateLoginId(loginId: String) {
+        if (loginId.isBlank()) {
+            throw CoreException(ErrorType.BAD_REQUEST, "로그인 ID는 비어있을 수 없습니다.")
+        }
+        if (!LOGIN_ID_PATTERN.matches(loginId)) {
+            throw CoreException(ErrorType.BAD_REQUEST, "로그인 ID는 영문과 숫자만 사용할 수 있습니다.")
+        }
+    }
 
-        val passwordPattern = Regex("^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[@\$!%*?&])[A-Za-z\\d@\$!%*?&#]{8,16}\$")
-        if (!passwordPattern.containsMatchIn(password)) throw CoreException(ErrorType.BAD_REQUEST, "비밀번호를 올바르게 입력해주세요.")
-
+    private fun validatePassword(password: String, birthday: LocalDate) {
+        if (!PASSWORD_PATTERN.matches(password)) {
+            throw CoreException(ErrorType.BAD_REQUEST, "비밀번호는 8~16자의 영문 대소문자, 숫자, 특수문자를 포함해야 합니다.")
+        }
         val birthdayString = birthday.toString().replace("-", "")
-        if (password.contains(birthdayString)) throw CoreException(ErrorType.BAD_REQUEST, "비밀번호에 생년월일을 포함할 수 없습니다.")
+        if (password.contains(birthdayString)) {
+            throw CoreException(ErrorType.BAD_REQUEST, "비밀번호에 생년월일을 포함할 수 없습니다.")
+        }
+    }
 
-        if (name.isBlank()) throw CoreException(ErrorType.BAD_REQUEST, "이름은 비어있을 수 없습니다.")
+    private fun validateName(name: String) {
+        if (name.isBlank()) {
+            throw CoreException(ErrorType.BAD_REQUEST, "이름은 비어있을 수 없습니다.")
+        }
+    }
 
-        val emailPattern = Regex("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,6}$")
-        if (!emailPattern.containsMatchIn(email)) throw CoreException(ErrorType.BAD_REQUEST, "이메일을 확인 해주세요.")
+    private fun validateEmail(email: String) {
+        if (!EMAIL_PATTERN.matches(email)) {
+            throw CoreException(ErrorType.BAD_REQUEST, "올바른 이메일 형식이 아닙니다.")
+        }
+    }
+
+    companion object {
+        private val LOGIN_ID_PATTERN = Regex("^[a-zA-Z0-9]+$")
+        private val PASSWORD_PATTERN = Regex("^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[@\$!%*?&])[A-Za-z\\d@\$!%*?&#]{8,16}$")
+        private val EMAIL_PATTERN = Regex("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,6}$")
     }
 }
