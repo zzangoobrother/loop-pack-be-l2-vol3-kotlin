@@ -1,4 +1,4 @@
-package com.loopers.domain.example
+package com.loopers.domain.user
 
 import com.loopers.domain.BaseEntity
 import com.loopers.support.error.CoreException

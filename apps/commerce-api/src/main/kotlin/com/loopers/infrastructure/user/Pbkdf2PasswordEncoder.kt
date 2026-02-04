@@ -1,6 +1,6 @@
-package com.loopers.infrastructure.example
+package com.loopers.infrastructure.user
 
-import com.loopers.domain.example.PasswordEncoder
+import com.loopers.domain.user.PasswordEncoder
 import org.springframework.stereotype.Component
 import java.security.SecureRandom
 import java.util.Base64

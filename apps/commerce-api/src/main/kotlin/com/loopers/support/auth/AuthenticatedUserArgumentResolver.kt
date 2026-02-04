@@ -1,6 +1,6 @@
 package com.loopers.support.auth
 
-import com.loopers.domain.example.User
+import com.loopers.domain.user.User
 import com.loopers.support.error.CoreException
 import com.loopers.support.error.ErrorType
 import org.springframework.core.MethodParameter

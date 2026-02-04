@@ -1,4 +1,4 @@
-package com.loopers.domain.example
+package com.loopers.domain.user
 
 interface UserRepository {
     fun find(id: Long): User?

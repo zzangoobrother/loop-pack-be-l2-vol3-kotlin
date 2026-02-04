@@ -1,7 +1,7 @@
-package com.loopers.infrastructure.example
+package com.loopers.infrastructure.user
 
-import com.loopers.domain.example.User
-import com.loopers.domain.example.UserRepository
+import com.loopers.domain.user.User
+import com.loopers.domain.user.UserRepository
 import org.springframework.data.repository.findByIdOrNull
 import org.springframework.stereotype.Component
 

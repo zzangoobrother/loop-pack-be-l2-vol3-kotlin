@@ -1,7 +1,7 @@
 package com.loopers.application.user
 
-import com.loopers.domain.example.MaskedName
-import com.loopers.domain.example.User
+import com.loopers.domain.user.MaskedName
+import com.loopers.domain.user.User
 import java.time.LocalDate
 
 data class UserInfo(

@@ -1,6 +1,6 @@
 package com.loopers.interfaces.api.user
 
-import com.loopers.domain.example.User
+import com.loopers.domain.user.User
 import com.loopers.interfaces.api.ApiResponse
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.tags.Tag

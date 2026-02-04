@@ -1,7 +1,7 @@
 package com.loopers.support.auth
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.loopers.domain.example.UserService
+import com.loopers.domain.user.UserService
 import com.loopers.interfaces.api.ApiResponse
 import com.loopers.support.error.CoreException
 import com.loopers.support.error.ErrorType

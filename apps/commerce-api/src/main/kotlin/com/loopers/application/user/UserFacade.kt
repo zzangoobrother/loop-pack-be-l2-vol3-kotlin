@@ -1,7 +1,7 @@
 package com.loopers.application.user
 
-import com.loopers.domain.example.User
-import com.loopers.domain.example.UserService
+import com.loopers.domain.user.User
+import com.loopers.domain.user.UserService
 import org.springframework.stereotype.Component
 import java.time.LocalDate
 

@@ -1,8 +1,8 @@
 package com.loopers.support.auth
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.loopers.domain.example.User
-import com.loopers.domain.example.UserService
+import com.loopers.domain.user.User
+import com.loopers.domain.user.UserService
 import com.loopers.support.error.ErrorType
 import jakarta.servlet.FilterChain
 import org.assertj.core.api.Assertions.assertThat
