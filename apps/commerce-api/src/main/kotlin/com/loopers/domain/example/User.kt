@@ -34,7 +34,6 @@ class User(
 
     init {
         validateLoginId(loginId)
-        validatePassword(password, birthday)
         validateName(name)
         validateEmail(email)
     }
@@ -45,16 +44,6 @@ class User(
         }
         if (!LOGIN_ID_PATTERN.matches(loginId)) {
             throw CoreException(ErrorType.BAD_REQUEST, "로그인 ID는 영문과 숫자만 사용할 수 있습니다.")
-        }
-    }
-
-    private fun validatePassword(password: String, birthday: LocalDate) {
-        if (!PASSWORD_PATTERN.matches(password)) {
-            throw CoreException(ErrorType.BAD_REQUEST, "비밀번호는 8~16자의 영문 대소문자, 숫자, 특수문자를 포함해야 합니다.")
-        }
-        val birthdayString = birthday.toString().replace("-", "")
-        if (password.contains(birthdayString)) {
-            throw CoreException(ErrorType.BAD_REQUEST, "비밀번호에 생년월일을 포함할 수 없습니다.")
         }
     }
 
@@ -72,7 +61,6 @@ class User(
 
     companion object {
         private val LOGIN_ID_PATTERN = Regex("^[a-zA-Z0-9]+$")
-        private val PASSWORD_PATTERN = Regex("^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[@\$!%*?&])[A-Za-z\\d@\$!%*?&#]{8,16}$")
         private val EMAIL_PATTERN = Regex("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,6}$")
     }
 }
