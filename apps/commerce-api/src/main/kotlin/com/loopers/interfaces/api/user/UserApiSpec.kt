@@ -1,5 +1,6 @@
 package com.loopers.interfaces.api.user
 
+import com.loopers.domain.example.User
 import com.loopers.interfaces.api.ApiResponse
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.tags.Tag
@@ -16,5 +17,5 @@ interface UserApiSpec {
         summary = "내 정보 조회",
         description = "인증된 사용자의 정보를 조회합니다.",
     )
-    fun getMe(loginId: String?, password: String?): ApiResponse<UserDto.MeResponse>
+    fun getMe(user: User): ApiResponse<UserDto.MeResponse>
 }

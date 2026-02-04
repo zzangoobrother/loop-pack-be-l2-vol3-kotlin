@@ -11,7 +11,6 @@ import org.junit.jupiter.api.assertAll
 import org.junit.jupiter.api.extension.ExtendWith
 import org.mockito.Mock
 import org.mockito.junit.jupiter.MockitoExtension
-import org.mockito.kotlin.whenever
 import java.time.LocalDate
 
 @ExtendWith(MockitoExtension::class)
@@ -30,28 +29,24 @@ class UserFacadeTest {
     @DisplayName("내 정보 조회 할 때,")
     @Nested
     inner class GetMe {
-        @DisplayName("유효한 인증 정보를 전달하면, 마스킹된 이름이 포함된 사용자 정보를 반환한다.")
+        @DisplayName("인증된 사용자를 전달하면, 마스킹된 이름이 포함된 사용자 정보를 반환한다.")
         @Test
-        fun returnsUserInfoWithMaskedName_whenValidCredentialsProvided() {
+        fun returnsUserInfoWithMaskedName_whenAuthenticatedUserProvided() {
             // arrange
-            val loginId = "testuser"
-            val password = "Abcd1234!@#$"
             val user = User(
-                loginId = loginId,
+                loginId = "testuser",
                 password = "encoded_password",
                 name = "홍길동",
                 email = "test@example.com",
                 birthday = LocalDate.of(1990, 1, 1),
             )
 
-            whenever(userService.authenticate(loginId, password)).thenReturn(user)
-
             // act
-            val result = userFacade.getMe(loginId, password)
+            val result = userFacade.getMe(user)
 
             // assert
             assertAll(
-                { assertThat(result.loginId).isEqualTo(loginId) },
+                { assertThat(result.loginId).isEqualTo("testuser") },
                 { assertThat(result.maskedName).isEqualTo("홍길*") },
                 { assertThat(result.email).isEqualTo("test@example.com") },
                 { assertThat(result.birthday).isEqualTo(LocalDate.of(1990, 1, 1)) },

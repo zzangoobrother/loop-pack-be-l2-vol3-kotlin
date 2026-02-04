@@ -1,5 +1,6 @@
 package com.loopers.application.user
 
+import com.loopers.domain.example.User
 import com.loopers.domain.example.UserService
 import org.springframework.stereotype.Component
 import java.time.LocalDate
@@ -13,8 +14,7 @@ class UserFacade(
             .let { UserInfo.from(it) }
     }
 
-    fun getMe(loginId: String, password: String): UserInfo {
-        return userService.authenticate(loginId, password)
-            .let { UserInfo.fromWithMasking(it) }
+    fun getMe(user: User): UserInfo {
+        return UserInfo.fromWithMasking(user)
     }
 }
