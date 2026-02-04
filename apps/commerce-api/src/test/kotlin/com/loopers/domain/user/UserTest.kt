@@ -12,6 +12,38 @@ import java.time.LocalDate
 
 class UserTest {
 
+    @DisplayName("비밀번호 변경할 때,")
+    @Nested
+    inner class ChangePassword {
+        private val loginId = "testuser1"
+        private val currentPassword = "encodedPassword123"
+        private val name = "홍길동"
+        private val email = "test@example.com"
+        private val birthday = LocalDate.of(1990, 5, 15)
+
+        @DisplayName("현재 비밀번호와 새 비밀번호가 동일하면, BAD_REQUEST 예외가 발생한다.")
+        @Test
+        fun throwsBadRequest_whenNewPasswordSameAsCurrent() {
+            // arrange
+            val user = User(
+                loginId = loginId,
+                password = currentPassword,
+                name = name,
+                email = email,
+                birthday = birthday,
+            )
+            val samePassword = currentPassword
+
+            // act
+            val exception = assertThrows<CoreException> {
+                user.changePassword(samePassword)
+            }
+
+            // assert
+            assertThat(exception.errorType).isEqualTo(ErrorType.BAD_REQUEST)
+        }
+    }
+
     @DisplayName("회원 생성할 때, 정상적으로 생성된다.")
     @Nested
     inner class Create {

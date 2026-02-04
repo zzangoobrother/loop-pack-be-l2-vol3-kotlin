@@ -43,4 +43,11 @@ class User(
             throw CoreException(ErrorType.BAD_REQUEST, "이름은 비어있을 수 없습니다.")
         }
     }
+
+    fun changePassword(newPassword: String) {
+        if (this.password == newPassword) {
+            throw CoreException(ErrorType.BAD_REQUEST, "새 비밀번호는 현재 비밀번호와 달라야 합니다.")
+        }
+        this.password = newPassword
+    }
 }
