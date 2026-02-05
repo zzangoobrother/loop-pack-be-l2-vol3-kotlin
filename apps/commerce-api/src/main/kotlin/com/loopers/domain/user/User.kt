@@ -43,4 +43,8 @@ class User(
             throw CoreException(ErrorType.BAD_REQUEST, "이름은 비어있을 수 없습니다.")
         }
     }
+
+    fun changePassword(encodedNewPassword: String) {
+        this.password = encodedNewPassword
+    }
 }

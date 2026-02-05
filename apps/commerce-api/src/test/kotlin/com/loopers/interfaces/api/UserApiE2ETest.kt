@@ -26,6 +26,7 @@ class UserApiE2ETest @Autowired constructor(
     companion object {
         private const val SIGNUP_ENDPOINT = "/api/v1/users/signup"
         private const val ME_ENDPOINT = "/api/v1/users/me"
+        private const val CHANGE_PASSWORD_ENDPOINT = "/api/v1/users/me/password"
         private const val LOGIN_ID_HEADER = "X-Loopers-LoginId"
         private const val LOGIN_PW_HEADER = "X-Loopers-LoginPw"
     }
@@ -33,6 +34,31 @@ class UserApiE2ETest @Autowired constructor(
     @AfterEach
     fun tearDown() {
         databaseCleanUp.truncateAllTables()
+    }
+
+    private fun signUp(
+        loginId: String,
+        password: String,
+        name: String,
+        email: String,
+        birthday: LocalDate,
+    ) {
+        val request = UserDto.SignUpRequest(
+            loginId = loginId,
+            password = password,
+            name = name,
+            email = email,
+            birthday = birthday,
+        )
+        val headers = HttpHeaders().apply {
+            contentType = MediaType.APPLICATION_JSON
+        }
+        testRestTemplate.exchange(
+            SIGNUP_ENDPOINT,
+            HttpMethod.POST,
+            HttpEntity(request, headers),
+            object : ParameterizedTypeReference<ApiResponse<UserDto.SignUpResponse>>() {},
+        )
     }
 
     @DisplayName("POST /api/v1/users/signup")
@@ -296,24 +322,197 @@ class UserApiE2ETest @Autowired constructor(
             // assert
             assertThat(response.statusCode.value()).isEqualTo(401)
         }
+    }
 
-        private fun signUp(loginId: String, password: String, name: String, email: String, birthday: LocalDate) {
-            val request = UserDto.SignUpRequest(
-                loginId = loginId,
-                password = password,
-                name = name,
-                email = email,
-                birthday = birthday,
+    @DisplayName("PATCH /api/v1/users/me/password")
+    @Nested
+    inner class ChangePassword {
+        @DisplayName("유효한 현재 비밀번호와 새 비밀번호로 요청하면, 200 OK 응답을 받는다.")
+        @Test
+        fun returnsOk_whenValidPasswordsProvided() {
+            // arrange - 먼저 회원가입
+            val loginId = "testuser123"
+            val currentPassword = "Test1234!@"
+            val newPassword = "NewPass1234!@"
+            signUp(loginId, currentPassword, "홍길동", "test@example.com", LocalDate.of(1990, 1, 15))
+
+            val request = UserDto.ChangePasswordRequest(
+                currentPassword = currentPassword,
+                newPassword = newPassword,
+            )
+            val headers = HttpHeaders().apply {
+                contentType = MediaType.APPLICATION_JSON
+                set(LOGIN_ID_HEADER, loginId)
+                set(LOGIN_PW_HEADER, currentPassword)
+            }
+            val httpEntity = HttpEntity(request, headers)
+
+            // act
+            val responseType = object : ParameterizedTypeReference<ApiResponse<Any>>() {}
+            val response = testRestTemplate.exchange(
+                CHANGE_PASSWORD_ENDPOINT,
+                HttpMethod.PATCH,
+                httpEntity,
+                responseType,
+            )
+
+            // assert
+            assertThat(response.statusCode.is2xxSuccessful).isTrue()
+        }
+
+        @DisplayName("현재 비밀번호가 일치하지 않으면, 401 Unauthorized 응답을 받는다.")
+        @Test
+        fun returnsUnauthorized_whenCurrentPasswordNotMatches() {
+            // arrange
+            val loginId = "testuser123"
+            val currentPassword = "Test1234!@"
+            signUp(loginId, currentPassword, "홍길동", "test@example.com", LocalDate.of(1990, 1, 15))
+
+            val request = UserDto.ChangePasswordRequest(
+                currentPassword = "WrongPassword1!",
+                newPassword = "NewPass1234!@",
+            )
+            val headers = HttpHeaders().apply {
+                contentType = MediaType.APPLICATION_JSON
+                set(LOGIN_ID_HEADER, loginId)
+                set(LOGIN_PW_HEADER, currentPassword)
+            }
+            val httpEntity = HttpEntity(request, headers)
+
+            // act
+            val responseType = object : ParameterizedTypeReference<ApiResponse<Any>>() {}
+            val response = testRestTemplate.exchange(
+                CHANGE_PASSWORD_ENDPOINT,
+                HttpMethod.PATCH,
+                httpEntity,
+                responseType,
+            )
+
+            // assert
+            assertThat(response.statusCode.value()).isEqualTo(401)
+        }
+
+        @DisplayName("새 비밀번호 형식이 올바르지 않으면, 400 Bad Request 응답을 받는다.")
+        @Test
+        fun returnsBadRequest_whenNewPasswordFormatInvalid() {
+            // arrange
+            val loginId = "testuser123"
+            val currentPassword = "Test1234!@"
+            signUp(loginId, currentPassword, "홍길동", "test@example.com", LocalDate.of(1990, 1, 15))
+
+            val request = UserDto.ChangePasswordRequest(
+                currentPassword = currentPassword,
+                newPassword = "weak",
+            )
+            val headers = HttpHeaders().apply {
+                contentType = MediaType.APPLICATION_JSON
+                set(LOGIN_ID_HEADER, loginId)
+                set(LOGIN_PW_HEADER, currentPassword)
+            }
+            val httpEntity = HttpEntity(request, headers)
+
+            // act
+            val responseType = object : ParameterizedTypeReference<ApiResponse<Any>>() {}
+            val response = testRestTemplate.exchange(
+                CHANGE_PASSWORD_ENDPOINT,
+                HttpMethod.PATCH,
+                httpEntity,
+                responseType,
+            )
+
+            // assert
+            assertThat(response.statusCode.value()).isEqualTo(400)
+        }
+
+        @DisplayName("새 비밀번호에 생년월일이 포함되면, 400 Bad Request 응답을 받는다.")
+        @Test
+        fun returnsBadRequest_whenNewPasswordContainsBirthday() {
+            // arrange
+            val loginId = "testuser123"
+            val currentPassword = "Test1234!@"
+            val birthday = LocalDate.of(1990, 1, 15)
+            signUp(loginId, currentPassword, "홍길동", "test@example.com", birthday)
+
+            val request = UserDto.ChangePasswordRequest(
+                currentPassword = currentPassword,
+                newPassword = "Pass19900115!@",
+            )
+            val headers = HttpHeaders().apply {
+                contentType = MediaType.APPLICATION_JSON
+                set(LOGIN_ID_HEADER, loginId)
+                set(LOGIN_PW_HEADER, currentPassword)
+            }
+            val httpEntity = HttpEntity(request, headers)
+
+            // act
+            val responseType = object : ParameterizedTypeReference<ApiResponse<Any>>() {}
+            val response = testRestTemplate.exchange(
+                CHANGE_PASSWORD_ENDPOINT,
+                HttpMethod.PATCH,
+                httpEntity,
+                responseType,
+            )
+
+            // assert
+            assertThat(response.statusCode.value()).isEqualTo(400)
+        }
+
+        @DisplayName("현재 비밀번호와 새 비밀번호가 동일하면, 400 Bad Request 응답을 받는다.")
+        @Test
+        fun returnsBadRequest_whenNewPasswordSameAsCurrent() {
+            // arrange
+            val loginId = "testuser123"
+            val currentPassword = "Test1234!@"
+            signUp(loginId, currentPassword, "홍길동", "test@example.com", LocalDate.of(1990, 1, 15))
+
+            val request = UserDto.ChangePasswordRequest(
+                currentPassword = currentPassword,
+                newPassword = currentPassword,
+            )
+            val headers = HttpHeaders().apply {
+                contentType = MediaType.APPLICATION_JSON
+                set(LOGIN_ID_HEADER, loginId)
+                set(LOGIN_PW_HEADER, currentPassword)
+            }
+            val httpEntity = HttpEntity(request, headers)
+
+            // act
+            val responseType = object : ParameterizedTypeReference<ApiResponse<Any>>() {}
+            val response = testRestTemplate.exchange(
+                CHANGE_PASSWORD_ENDPOINT,
+                HttpMethod.PATCH,
+                httpEntity,
+                responseType,
+            )
+
+            // assert
+            assertThat(response.statusCode.value()).isEqualTo(400)
+        }
+
+        @DisplayName("인증 헤더가 누락되면, 401 Unauthorized 응답을 받는다.")
+        @Test
+        fun returnsUnauthorized_whenAuthHeadersMissing() {
+            // arrange
+            val request = UserDto.ChangePasswordRequest(
+                currentPassword = "Test1234!@",
+                newPassword = "NewPass1234!@",
             )
             val headers = HttpHeaders().apply {
                 contentType = MediaType.APPLICATION_JSON
             }
-            testRestTemplate.exchange(
-                SIGNUP_ENDPOINT,
-                HttpMethod.POST,
-                HttpEntity(request, headers),
-                object : ParameterizedTypeReference<ApiResponse<UserDto.SignUpResponse>>() {},
+            val httpEntity = HttpEntity(request, headers)
+
+            // act
+            val responseType = object : ParameterizedTypeReference<ApiResponse<Any>>() {}
+            val response = testRestTemplate.exchange(
+                CHANGE_PASSWORD_ENDPOINT,
+                HttpMethod.PATCH,
+                httpEntity,
+                responseType,
             )
+
+            // assert
+            assertThat(response.statusCode.value()).isEqualTo(401)
         }
     }
 }

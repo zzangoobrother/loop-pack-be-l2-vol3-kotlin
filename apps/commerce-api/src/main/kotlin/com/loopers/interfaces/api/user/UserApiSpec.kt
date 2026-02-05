@@ -18,4 +18,10 @@ interface UserApiSpec {
         description = "인증된 사용자의 정보를 조회합니다.",
     )
     fun getMe(user: User): ApiResponse<UserDto.MeResponse>
+
+    @Operation(
+        summary = "비밀번호 변경",
+        description = "현재 비밀번호를 확인 후 새 비밀번호로 변경합니다.",
+    )
+    fun changePassword(user: User, request: UserDto.ChangePasswordRequest): ApiResponse<Unit>
 }

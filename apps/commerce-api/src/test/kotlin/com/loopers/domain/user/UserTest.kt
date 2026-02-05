@@ -12,14 +12,44 @@ import java.time.LocalDate
 
 class UserTest {
 
+    @DisplayName("비밀번호 변경할 때,")
+    @Nested
+    inner class ChangePassword {
+        private val loginId = "testuser1"
+        private val currentEncodedPassword = "encoded_current_password"
+        private val name = "홍길동"
+        private val email = "test@example.com"
+        private val birthday = LocalDate.of(1990, 5, 15)
+
+        @DisplayName("새 비밀번호로 변경하면, 비밀번호가 변경된다.")
+        @Test
+        fun changesPassword_whenNewPasswordProvided() {
+            // arrange
+            val newEncodedPassword = "encoded_new_password"
+            val user = User(
+                loginId = loginId,
+                password = currentEncodedPassword,
+                name = name,
+                email = email,
+                birthday = birthday,
+            )
+
+            // act
+            user.changePassword(newEncodedPassword)
+
+            // assert
+            assertThat(user.password).isEqualTo(newEncodedPassword)
+        }
+    }
+
     @DisplayName("회원 생성할 때, 정상적으로 생성된다.")
     @Nested
     inner class Create {
-        var loginId = "abcde12345"
-        var password = "Abcd1234abcd!@#$"
-        var name = "홍길동"
-        var email = "abcde@gmail.com"
-        var birthday = LocalDate.of(1980, 1, 1)
+        private val loginId = "abcde12345"
+        private val password = "Abcd1234abcd!@#$"
+        private val name = "홍길동"
+        private val email = "abcde@gmail.com"
+        private val birthday = LocalDate.of(1980, 1, 1)
 
         @DisplayName("회원 데이터가 모두 주어지면, 정상적으로 생성된다.")
         @Test

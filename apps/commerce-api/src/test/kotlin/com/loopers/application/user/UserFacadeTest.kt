@@ -11,6 +11,7 @@ import org.junit.jupiter.api.assertAll
 import org.junit.jupiter.api.extension.ExtendWith
 import org.mockito.Mock
 import org.mockito.junit.jupiter.MockitoExtension
+import org.mockito.kotlin.verify
 import java.time.LocalDate
 
 @ExtendWith(MockitoExtension::class)
@@ -51,6 +52,31 @@ class UserFacadeTest {
                 { assertThat(result.email).isEqualTo("test@example.com") },
                 { assertThat(result.birthday).isEqualTo(LocalDate.of(1990, 1, 1)) },
             )
+        }
+    }
+
+    @DisplayName("비밀번호 변경할 때,")
+    @Nested
+    inner class ChangePassword {
+        @DisplayName("유효한 비밀번호를 전달하면, UserService.changePassword를 호출한다.")
+        @Test
+        fun callsUserServiceChangePassword_whenValidPasswordsProvided() {
+            // arrange
+            val user = User(
+                loginId = "testuser",
+                password = "encoded_password",
+                name = "홍길동",
+                email = "test@example.com",
+                birthday = LocalDate.of(1990, 5, 15),
+            )
+            val currentPassword = "CurrentPassword1!"
+            val newPassword = "NewPassword1!"
+
+            // act
+            userFacade.changePassword(user, currentPassword, newPassword)
+
+            // assert
+            verify(userService).changePassword(user.id, currentPassword, newPassword)
         }
     }
 }

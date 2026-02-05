@@ -17,4 +17,8 @@ class UserFacade(
     fun getMe(user: User): UserInfo {
         return UserInfo.fromWithMasking(user)
     }
+
+    fun changePassword(user: User, currentPassword: String, newPassword: String) {
+        userService.changePassword(user.id, currentPassword, newPassword)
+    }
 }
