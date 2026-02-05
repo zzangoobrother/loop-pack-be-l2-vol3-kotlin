@@ -8,6 +8,7 @@ import com.loopers.support.error.ErrorType
 import org.slf4j.LoggerFactory
 import org.springframework.http.ResponseEntity
 import org.springframework.http.converter.HttpMessageNotReadableException
+import org.springframework.web.bind.MethodArgumentNotValidException
 import org.springframework.web.bind.MissingServletRequestParameterException
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
@@ -44,6 +45,15 @@ class ApiControllerAdvice {
         val type = e.parameterType
         val message = "필수 요청 파라미터 '$name' (타입: $type)가 누락되었습니다."
         return failureResponse(errorType = ErrorType.BAD_REQUEST, errorMessage = message)
+    }
+
+    @ExceptionHandler
+    fun handleValidation(e: MethodArgumentNotValidException): ResponseEntity<ApiResponse<*>> {
+        val errorMessage = e.bindingResult.fieldErrors
+            .firstOrNull()
+            ?.defaultMessage
+            ?: "요청 값이 올바르지 않습니다."
+        return failureResponse(errorType = ErrorType.BAD_REQUEST, errorMessage = errorMessage)
     }
 
     @ExceptionHandler
