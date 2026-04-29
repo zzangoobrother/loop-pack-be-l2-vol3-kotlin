@@ -154,21 +154,223 @@ SELECT * FROM products WHERE brand_id = 1 ORDER BY price ASC LIMIT 20;
 
 **핵심 본질**: 복합 인덱스 `(A, B)` = A로 1차 정렬, 동일 A 내에서 B로 2차 정렬된 책. A로 좁혀진 영역 안은 이미 B 순으로 정렬되어 있음.
 
-**[다음 진행 예정 — 범위 조건 함정 (range condition trap)]**
-질문 던진 상태, 답변 대기 중:
-> 인덱스 (brand_id, price, likes_count) + 쿼리 `WHERE brand_id=1 AND price > 10000 ORDER BY likes_count DESC LIMIT 20`
-> → likes_count 정렬을 filesort 없이 처리할 수 있는가?
-> 핵심: "범위(range) 조건은 그 뒤 컬럼의 정렬을 깨뜨린다"
+**[후속 질문: 범위 조건 함정 (range condition trap)]**
+인덱스 `(brand_id, price, likes_count)` + 쿼리 `WHERE brand_id=1 AND price > 10000 ORDER BY likes_count DESC LIMIT 20`
+→ likes_count 정렬을 filesort 없이 처리할 수 있는가?
+
+**[힌트 (B+Tree 시각화 제공)]**
+brand_id=1 영역에서 인덱스의 실제 정렬 모습:
+- price=8000 → likes_count: [10, 50, 200, 800] (같은 price 안에서만 정렬)
+- price=12000 → likes_count: [5, 30, 100, 600, 1500] (같은 price 안에서만 정렬)
+- price=18000, 25000, 30000 ... 각각 같은 price 그룹 안에서만 정렬됨
+
+시나리오 비교:
+- A. `price = 12000` (등치) → likes_count 정렬 살아있음
+- B. `price > 10000` (범위) → 여러 price 그룹을 가로지르므로 likes_count 순서 깨짐
+
+**[답변]**
+> 시나리오 A : n (filesort 불필요)
+> 시나리오 B : 따로 정렬
+> price = 12000 인 데이터만 sort 하기 때문에 b+tree 에서 다른 데를 갈 필요 없지만
+> price > 10000 이면 모든 데이터를 가져오도록 찾아야 하고, 다 찾은 다음 sort 한다
+
+**[평가]**
+- ✅ 본질 정확히 잡음. 등치 = 한 점, 범위 = 여러 그룹.
+
+**[정리: 한 줄 룰]**
+복합 인덱스 `(A, B, C)`에서, 앞쪽 컬럼이 **등치(=)** 조건이면 뒤 컬럼의 정렬이 살아있고, **범위(>, <, BETWEEN, LIKE 'abc%')** 조건이면 그 뒤 컬럼의 정렬이 깨진다. → "범위 조건 함정 (Range Condition Trap)"
+
+[글감] "복합 인덱스에서 ORDER BY가 안 먹는 진짜 이유 — 등치는 한 점, 범위는 여러 그룹"
+
+**[추가 질문 (c): filesort 제거하려면 인덱스를 어떻게 바꿔야 하나?]**
+후보:
+1. (brand_id, likes_count)
+2. (brand_id, likes_count, price)
+3. 그 외
+
+**[답변]**
+> 후보 2, brand_id, likes_count 순서로 인덱스 설정 후 나머지 price > 10000 조건에서 모든 데이터를 바로 가져올 수 있음
+
+**[평가]**
+- ✅ 후보 2 적절. ICP(Index Condition Pushdown) 효과 직관으로 잡음 — price 컬럼이 인덱스에 있으니 인덱스 단계에서 필터 가능
+- ⚠ 단점은 명시 안 함 → 두 방향 흔들기 진행
+
+**[흔들기 1: likes_count는 어떤 종류의 컬럼인가?]**
+- brand_id: 거의 안 변함
+- price: 가끔 변함
+- likes_count: 매우 자주 변함
+- 인덱스 컬럼 값이 변하면 인덱스에서 row 위치가 어떻게 되는가?
+- Round 4의 핫 row 좋아요 동시성과 어떻게 연결되는가?
+
+**[답변]**
+> likes_count은 자주 변하는 데이터이기 때문에 인덱스 변경이 자주 발생할 것이다.
+> likes_count가 1 증가하면 b+tree의 재정렬을 의미하고 1초 1000번이면 1초 1000번 재정렬이 발생한다
+
+**[평가 + 보강]**
+- ✅ 핵심 잡음
+- 보강: "재정렬"의 정확한 의미 = **삭제 + 새 위치 삽입** (단순 값 변경이 아닌 물리적 이동)
+- 1초 1000번 → 인덱스 페이지 **X-lock 경합** (Round 4 락 경합과 동일 메커니즘) + 페이지 split/merge → 디스크 I/O + buffer pool dirty 폭증 → fsync 부담
+- **결론**: 자주 변하는 컬럼을 인덱스 컬럼으로 두는 건 위험. 비정규화/Materialized View가 필요한 이유로 자연 연결.
+
+**[흔들기 2: LIMIT + 약한 필터의 함정]**
+시나리오 비교:
+- 시나리오 X: brand_id=1 상품 중 80%가 price > 10000 → 인덱스 몇 개 읽으면 LIMIT 20 채워지나?
+- 시나리오 Y: 1%만 매칭 → ?
+
+**[답변]**
+> 시나리오 X : 20개
+> 시나리오 Y : 조건에 맞는 모든 데이터를 읽게 된다. 매칭률이 1%일 때 (10개 데이터)... 20개 데이터가 될때까지 읽는다
+
+**[평가 + 산수 명확화]**
+- ✅ 본질 잡음. 시나리오 X는 정답 (20개)
+- 시나리오 Y 산수: 매칭률 1% → 결과 20개 채우려면 평균 **2,000개의 인덱스 엔트리**를 거꾸로 스캔 (1/0.01 × 20)
+- worst case: 매칭 row가 5개뿐이면 인덱스 거의 다 스캔해도 LIMIT 못 채움
+- 본질: **"LIMIT N + ORDER BY + 약한 WHERE 필터" 함정** — filesort는 피했는데 인덱스 깊이 스캔 비용이 폭증
+
+[글감] "ORDER BY ... LIMIT N"의 숨은 함정 — 정렬을 살려도 약한 필터를 만나면 인덱스를 끝까지 긁는다
+
+**[Q3 종합 정리]**
+
+| 함정 | 본질 |
+|---|---|
+| 범위 조건 함정 | 등치 = 한 점, 범위 = 여러 그룹 → 그 뒤 컬럼 정렬 깨짐 |
+| LIMIT + 약한 필터 | 정렬은 살아도 인덱스 깊이 스캔, worst case는 인덱스 끝까지 |
+| 자주 변하는 컬럼을 인덱스에 | 트리 위치 이동(삭제+삽입) + 락 경합 (Round 4 동시성과 직결) |
+
+→ "likes_count를 인덱스 컬럼으로 두는 건 위험" 결론 = Q4의 비정규화/MV 논의로 자연 연결
 
 ---
 
-## ⏸ 학습 일시 중단 (Q3 진행 중)
-이 시점까지 진행 — 다음 재개 시 Q3의 "범위 조건 함정" 후속 질문부터 이어갈 것.
+---
+
+## Q4. 좋아요 수 정렬 — JOIN+GROUP BY 비용 / 비정규화 vs Materialized View
+
+**[질문 (a)/(b): JOIN+GROUP BY+ORDER BY+LIMIT 쿼리의 비용 분석]**
+```sql
+SELECT p.*, COUNT(l.id) AS like_count
+FROM product p LEFT JOIN likes l ON p.id = l.product_id
+GROUP BY p.id ORDER BY like_count DESC LIMIT 20;
+```
+- product 10만, likes 1000만 가정. PK + (product_id) 인덱스 있음
+
+**[답변]**
+> a : product, likes join을 통해 하나의 테이블을 만들고, GROUP BY → ORDER BY 순으로 처리. 모든 데이터에서 20개만 뽑는다.
+> b : 모든 데이터를 생성한 후 20개를 뽑아야 하기 때문에 20개 뽑기 전 까지의 과정이 느리다
+
+**[정리: TOP-N 최적화 실패]**
+- ORDER BY 키가 "컬럼"이 아니라 "집계 결과값"이면, 모든 그룹의 집계가 끝나야 정렬이 가능 → LIMIT은 정렬 끝난 후에야 적용
+- JOIN(1000만 row) → GROUP BY(10만 그룹) → ORDER BY filesort(10만) → LIMIT 20
+- 인덱스 정렬이 살아있으면 N개 읽고 멈출 수 있는데(TOP-N), 집계 결과로 정렬할 땐 멈출 지점을 알 수가 없음
+
+[글감] LIMIT 20이 거짓말이 되는 순간 — 정렬 키가 컬럼인가 집계값인가가 가른다
+
+**[질문 (c-1)/(c-2)/(c-3): 비정규화 (product에 like_count 추가)로 가면?]**
+```sql
+ALTER TABLE product ADD COLUMN like_count INT;
+CREATE INDEX idx_like_count ON product(like_count);
+SELECT * FROM product ORDER BY like_count DESC LIMIT 20;
+```
+
+**[답변]**
+> c-1 : product의 like_count만 정렬해서 20개만 가져오기 때문에 그전 JOIN+GROUP BY+filesort+full sort 과정이 필요없다
+> c-2 : 인덱스의 비용은 product로 넘어갔다. like_count를 인덱스로 만든다면 +1을 한다면 인덱스의 b+tree는 자주 변경될 것이다
+> c-3 : (질문 의도 명확화 필요)
+
+**[흔들기 1: Lost Update가 정말 발생하나?]**
+패턴 A (애플리케이션 read-modify-write 분리): SELECT → +1 → UPDATE → lost update 발생 ✓
+패턴 B (DB 원자적): UPDATE x = x + 1 → X-lock으로 직렬화 → lost update 발생 안 함
+
+**[답변]**
+> 패턴 A 에서 발생하네
+
+**[흔들기 2: TPS는 정말 1000인가?]**
+- 1000개 UPDATE가 같은 row의 X-lock을 두고 줄 서서 직렬화
+- 한 트랜잭션 평균 5ms → 같은 row TPS = 200
+- 1000 RPS인데 200 TPS 한계 → 800개 대기 큐 → 응답 지연 폭증 → DB connection pool 고갈 → 도미노 장애
+
+**[답변]**
+> 200 tps
+
+**[흔들기 3: 어떤 락 패턴인가?]**
+- 낙관적 락 ❌ — 버전 충돌 시 재시도, 평소엔 락 안 잡음
+- **비관적 락 (X-lock)** ✓ — 들어오는 순간 락 잡고 다른 트랜잭션은 대기 (Round 4 재고 차감과 동일)
+
+**[답변]**
+> 비관적 락
+
+**[Q4 (c) 정리: 비정규화의 진짜 비용]**
+| 갈래 | 메커니즘 | 영향 |
+|---|---|---|
+| 인덱스 변동 | like_count 변경 시 인덱스 트리에서 row 위치 이동 | 페이지 split/I/O |
+| 핫 row 락 경합 | 같은 row에 X-lock 직렬화 | TPS 상한 → 응답 지연 → 타임아웃 도미노 |
+
+[글감] 비정규화의 진짜 비용은 인덱스가 아니라 핫 row 비관적 락 경합 — 1000 RPS인데 200 TPS가 한계라면 무슨 일이?
+
+**[질문 (d): 핫 row 락 경합을 어떻게 풀까?]**
+방향 힌트: 시점 분리 / 저장소 분리 / 카운터 분산
+
+**[답변]**
+> spring event 또는 kafka를 사용하여 이벤트 처리, redis에 저장하고, 시간마다 db 업데이트
+
+**[흔들기 1: 컨슈머에서 락 경합은 사라지나?]**
+단순 이벤트 발행만으론 부족 — 컨슈머가 같은 row를 1000번 UPDATE하면 락 경합 그대로
+
+**[답변]**
+> 쌓인 이벤트 개수를 세워 한꺼번에 업데이트
+✓ 이벤트 배치 집계 — product별로 그룹핑 후 +N 한 번에 UPDATE. 락 경합 1/N로 감소
+
+**[흔들기 2: Redis에 카운터 두면 정렬은 어디서?]**
+
+**[답변]**
+> db에 있는 like_count를 가지고 정렬을 할거야. 트레이드오프 필요 — 정확성이냐, 정확성 떨어져도 성능을 잡냐
+✓ DB의 stale 값으로 정렬. 정확성 vs 성능 트레이드오프 명확히 잡음
+
+**[흔들기 3: UX 보완 (사용자가 좋아요 직후 새로고침)]**
+
+**[답변]**
+> 프론트에서 캐시로 좋아요한 표시. 비슷한 비동기 시간마다 캐시 지우고 백엔드 호출
+✓ Optimistic UI 패턴. "전역 like_count는 stale, 본인 액션은 즉시 반영" — 일관성 경계를 사용자별로 분리
+
+**[Q4 종합: 좋아요 수 정렬 4가지 패턴]**
+
+| 패턴 | 조회 | 쓰기 | 실시간성 | 확장성 |
+|---|---|---|---|---|
+| ① 정규화 + JOIN/GROUP BY | ❌ | ✅ | ✅ | ✅ |
+| ② 비정규화 + 동기 갱신 | ✅ | ❌ 핫 row 락 경합 | ✅ | ⚠ |
+| ③ 비정규화 + 비동기 갱신 (이벤트 배치) | ✅ | ✅ | ⚠ stale | ⚠ |
+| ④ Materialized View / 조회 전용 테이블 | ✅✅ | ⚠ 별도 동기화 | ⚠ stale | ✅ 여러 view |
+
+**핵심 인사이트:**
+- ②는 운영 위험 (1000 RPS vs 200 TPS)
+- ③/④는 같은 발상 — "읽기 구조와 쓰기 구조의 동기화 시점을 분리하라" = **Pre-aggregation의 본질**
+- ④의 진짜 가치: 같은 데이터를 **조회 패턴별로 여러 view**로 미리 만들 수 있음
+
+[글감] 비정규화 vs Materialized View — 둘 다 Pre-aggregation이지만, 동기 vs 비동기, 컬럼 추가 vs 별도 테이블의 차이가 운영에서는 결정적
+
+---
+
+---
+
+## Q5. Redis 캐시 — TTL / 무효화 / 캐시 미스 폭주 (진행 중)
+
+**[질문 (a): 캐시의 본질 — 왜 빠르고 어디서 정확도를 잃는가?]**
+- 캐시 적중 시 어떤 비용이 사라지는가? (네트워크/디스크/파싱 등)
+- stale data가 발생하는 시점은 정확히 언제인가?
+
+**[질문 (b): TTL 결정의 트레이드오프]**
+- TTL 1초 / 1시간 / 24시간 각각의 문제?
+- TTL 결정의 본질적 기준은? (힌트: "데이터가 얼마나 자주 바뀌는가" + 한 가지 더)
+
+**[답변 대기 중 — 다음 재개 시 (a), (b)부터]**
+
+---
+
+## ⏸ 학습 일시 중단 (Q5 진행 중)
+이 시점까지 진행 — 다음 재개 시 Q5 (a), (b)부터 이어갈 것.
 
 남은 영역:
-- Q3 마무리 — 범위 조건 함정
-- Q4 — 좋아요 수 정렬: JOIN+GROUP BY 비용 / 비정규화 vs Materialized View
-- Q5 — Redis 캐시: TTL / 무효화 / 캐시 미스 폭주
+- Q5 (a)/(b): 캐시 본질 + TTL 트레이드오프
+- Q5 흔들기: Cache Stampede (캐시 미스 폭주), 무효화 전략 (TTL vs 이벤트 무효화 vs Write-Through)
 - Q6 — Pre-aggregation / 코드 기반 분석 (ProductCacheManager, ProductCacheWarmingScheduler 등)
 - Q7 — 백지 설계 테스트
 
