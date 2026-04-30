@@ -599,26 +599,126 @@ SELECT * FROM product ORDER BY like_count DESC LIMIT 20;
 
 ## Q7. Pre-aggregation 실제 구현 — Q4의 발상이 코드에서 어떻게 살아있는가 (진행 중)
 
+### 도입부 — Q4 4가지 패턴 환기
+
+Q4에서 좋아요 수 정렬을 위한 4가지 패턴을 비교했음:
+- ① 정규화 + JOIN/GROUP BY (느림)
+- ② 비정규화 + 동기 갱신 (핫 row 락 경합)
+- ③ 비정규화 + 비동기 갱신 (이벤트 배치)
+- ④ Materialized View / 조회 전용 테이블
+
+이 라운드 코드는 이 중 **무엇을, 어떻게** 구현했는가? 코드를 보면서 분석.
+
+---
+
+### Q7 분석 대상 코드 발췌
+
+**[코드 1] `RankingRedisRepository.getTopRankings` (Daily 랭킹 조회 — Redis ZSet)**
+
+```kotlin
+override fun getTopRankings(date: LocalDate, offset: Long, count: Long): List<RankingEntry> {
+    val key = RedisKeys.rankingKey(date.format(DATE_FORMATTER))  // "ranking:20260430"
+    val result = redisTemplate.opsForZSet()
+        .reverseRangeWithScores(key, offset, offset + count - 1) ?: emptySet()
+    return result.mapNotNull { typedTuple -> ... }
+}
+```
+→ **Redis Sorted Set (ZSet)** 사용. 점수 기반으로 정렬된 자료구조.
+
+**[코드 2] `getTopRankingsFromDb` (DB Fallback)**
+
+```kotlin
+override fun getTopRankingsFromDb(offset: Long, count: Long): List<RankingEntry> {
+    val sql = """
+        SELECT pm.product_id,
+               (pm.view_count * 0.1 + pm.like_count * 0.2 + pm.sales_count * 0.7) AS score
+        FROM product_metrics pm
+        INNER JOIN products p ON pm.product_id = p.id
+        WHERE p.deleted_at IS NULL
+        ORDER BY score DESC
+        LIMIT ? OFFSET ?
+    """
+    ...
+}
+```
+→ **`product_metrics` 테이블** — 상품별로 view/like/sales 누적 수치를 미리 저장한 별도 테이블. JOIN/GROUP BY 없음.
+
+**[코드 3] `DailyRankingStrategy` (Redis 우선, DB 폴백)**
+
+```kotlin
+override fun getRankings(date: LocalDate, page: Int, size: Int): RankingResult {
+    val entries = runCatching {
+        rankingService.getTopRankings(date, page, size)        // Redis ZSet
+    }.getOrElse {
+        log.warn("Redis 랭킹 조회 실패, DB fallback 수행", it)
+        rankingService.getTopRankingsFromDb(page, size)        // DB product_metrics
+    }
+    ...
+}
+```
+
+**[코드 4] 시간 단위별 전략 분기**
+
+```
+DailyRankingStrategy   → Redis ZSet (실시간)
+WeeklyRankingStrategy  → 별도 JDBC 리포지토리 (배치 집계)
+MonthlyRankingStrategy → 별도 JDBC 리포지토리 (배치 집계)
+```
+
+---
+
 ### Q7 (a) Sorted Set 선택의 본질
 
+> Daily 랭킹 저장 자료구조 후보:
+> - **Hash** (`HSET ranking:20260430 productId score`)
+> - **List** (productId 순서대로 push)
+> - **Sorted Set / ZSet** (점수 기반 자동 정렬)
+> 코드는 ZSet을 선택했음. 이유는?
+
 **[질문]**
-- a-1. 좋아요 +1 동작을 Hash / List / ZSet 각각으로 구현 시 시간 복잡도?
+- a-1. 좋아요 +1 동작을 각 자료구조로 구현한다면?
+  - Hash: 어떻게? 시간 복잡도?
+  - List: 어떻게? 시간 복잡도?
+  - ZSet `ZINCRBY`: 어떻게? 시간 복잡도?
 - a-2. TOP 100 조회를 각 자료구조로 한다면?
-- a-3. ZSet 선택의 본질은 Q4의 ④ 패턴과 어떻게 직결되나?
+  - Hash: ?
+  - List: ?
+  - ZSet `ZREVRANGE`: ?
+- a-3. ZSet이 선택된 본질은 — "**정렬 상태를 미리 유지하는 자료구조**"라는 발상이 Q4의 어떤 패턴과 직결되나?
+
+힌트 (a-3): Q4의 ④ 패턴 — "읽기 구조와 쓰기 구조의 동기화 시점 분리". ZSet은 **쓰기 시점에 정렬 비용을 분산**하는 자료구조.
+
+---
 
 ### Q7 (b) `product_metrics` 테이블의 정체
 
+> 코드 2에서 `product_metrics` 테이블 등장. `view_count`, `like_count`, `sales_count` 컬럼이 미리 누적되어 있음.
+
 **[질문]**
-- b-1. Q4의 어떤 패턴인가? (① 정규화 / ② 비정규화 동기 / ③ 비정규화 비동기 / ④ Materialized View)
-- b-2. 이 테이블 없으면 SQL이 어떻게 생기나? (likes/products/orders 직접 집계)
-- b-3. Redis ZSet이 있는데 왜 DB에 또 `product_metrics`를 둘까?
+- b-1. Q4의 어떤 패턴? (① 정규화 / ② 비정규화 동기 / ③ 비정규화 비동기 / ④ Materialized View)
+- b-2. 이 테이블 없으면 `getTopRankingsFromDb`의 SQL은 어떻게 생기나? (likes / products / orders 테이블에서 직접 집계한다면)
+- b-3. Redis ZSet이 있는데도 굳이 DB에 또 `product_metrics`를 두는 이유 — 이중 저장의 의도는?
+
+힌트 (b-3): 코드 3의 `getOrElse` — Redis 장애 시 폴백. 가용성 / 회복 탄력성 측면에서 본질은?
+
+---
 
 ### Q7 (c) 시간 단위별 전략 분기의 본질
 
+> Daily는 Redis ZSet (실시간), Weekly/Monthly는 별도 배치 집계. 같은 "랭킹"인데 왜 다른 전략?
+
+**[시나리오 비교]**
+- **Daily**: 좋아요 1개 → 즉시 점수 반영 필요? 1분 늦어도 됨? 1시간 늦어도 됨?
+- **Monthly**: 한 달간 누적된 점수. 1분 단위 실시간성이 의미 있나?
+
 **[질문]**
-- c-1. Daily가 실시간성을 요구하는 이유는?
+- c-1. Daily가 실시간성을 요구하는 이유는? (사용자 경험 / 비즈니스 측면)
 - c-2. Monthly가 실시간성을 요구하지 않는 이유는?
-- c-3. 그 결과 자료구조 선택이 어떻게 갈리는가?
+- c-3. 그 결과 자료구조 선택이 어떻게 갈리는가? (실시간 누적 vs 배치 집계)
+
+힌트: 시간 범위가 길수록 "한 건의 +1"이 전체 점수에 미치는 영향이 작음 → 실시간 누적의 가치 감소 → 배치 집계가 효율적.
+
+---
 
 **[답변 대기 중 — 다음 재개 시 (a)/(b)/(c)부터]**
 
