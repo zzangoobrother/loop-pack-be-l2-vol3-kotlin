@@ -720,16 +720,160 @@ MonthlyRankingStrategy → 별도 JDBC 리포지토리 (배치 집계)
 
 ---
 
-**[답변 대기 중 — 다음 재개 시 (a)/(b)/(c)부터]**
+### Q7 (b) — `product_metrics` 테이블의 정체 (재개)
+
+**[1차 답변]**
+> b-1 : ④
+> b-3 : redis는 서버가 죽으면 데이터가 사라지고, db는 영구적으로 저장이 가능하니 db를 사용한다. 물론 redis 를 영구적으로 설정가능하지만 성능에 영향을 줄 수 있기 때문에 생각을 해봐야 한다
+
+**[1차 평가 + 흔들기]**
+- b-1 ✅ ④ 맞으나, ② vs ④의 결정적 차이("테이블 분리의 의미")는 미답 → 흔들기 진행
+- b-2 미답 → 다시 요청
+- b-3 "휘발 vs 영속" 표면적, 진짜 본질("역할 분리")로 끌어내기
+
+**[2차 답변]**
+> b-1 : 랭킹은 부가적인 기능이기 때문에 동기로 묶는다면 랭킹 데이터를 업데이트하다가 문제가 발생한면 비즈니스에 영향을 주게 된다
+> b-2 : product_metrics 이 없다면 join 을 해서 가져와야 하는데 많은 join은 데이터 성능에 문제가 생기기 때문에 비정규화가 좋다
+
+**[2차 평가]**
+- b-1 ⚠ "장애 격리" 관점은 맞지만 ② vs ④ 차이는 아님 (동기/비동기 축에 가까움). 진짜 차이는 "읽기 부하 분리"
+- b-2 ⚠ "JOIN이 많아서 느리다"는 표면적 — TOP-N 최적화 실패 본질 미달
+
+**[정답 제시 (사용자 요청)]**
+
+**b-1 본질 — 테이블 분리 = 읽기 부하 분리**
+- product 테이블은 거의 모든 화면(상세/목록/검색/장바구니/주문/추천)이 읽는 핵심 길목
+- like_count를 product에 추가 시:
+  - buffer pool 오염 (dirty page 폭증)
+  - row size 증가 → 페이지당 row 수 감소 → 풀 스캔 비용 증가
+  - 인덱스 갱신 폭증 (Q3 핫 row 위험)
+  - 장애 전파 (통계 갱신 장애가 product read 영향)
+- 별도 테이블(product_metrics): 핫 쓰기가 핵심 read 오염 안 함 + Daily/Weekly/Monthly 여러 view 재사용
+
+**b-2 본질 — LIMIT 20의 거짓말 (TOP-N 실패)**
+```sql
+-- product_metrics 없을 때
+SELECT p.id,
+       (COALESCE(v.cnt, 0) * 0.1 + COALESCE(l.cnt, 0) * 0.2 + COALESCE(o.cnt, 0) * 0.7) AS score
+FROM products p
+LEFT JOIN (SELECT product_id, COUNT(*) cnt FROM likes GROUP BY product_id) l ON ...
+LEFT JOIN (SELECT product_id, SUM(quantity) cnt FROM order_items GROUP BY product_id) o ON ...
+LEFT JOIN (SELECT product_id, COUNT(*) cnt FROM product_views GROUP BY product_id) v ON ...
+ORDER BY score DESC LIMIT 20;
+```
+| 단계 | 비용 |
+|---|---|
+| likes 1000만 GROUP BY | 1000만 row 스캔 → 10만 그룹 |
+| products 10만 LEFT JOIN | 10만 row 결과 |
+| score 계산 → ORDER BY | **score는 계산식 → 인덱스 못 씀 → filesort 10만** |
+| LIMIT 20 | 정렬 끝난 뒤 자르기 |
+
+핵심: 정렬 키가 컬럼이면 TOP-N (N개 멈춤), 계산식이면 모든 그룹 만든 뒤 정렬 → LIMIT은 단순 자르기
+
+product_metrics 있으면: GROUP BY는 사라지지만 score 계산식은 여전 → filesort 10만 잔존 (절반의 최적화)
+**진짜 TOP-N은 Redis ZSet** — score가 자료구조 안에 정렬된 채로 유지
+
+**b-3 본질 — DB는 source of truth, Redis는 view**
+
+| 시나리오 | Redis ZSet | DB | 의미 |
+|---|---|---|---|
+| Redis 클러스터 새로 띄움 | 비어있음 | raw 그대로 | DB에서 재구축 가능 |
+| 점수 가중치 변경 | stale | raw 그대로 | 새 가중치로 재계산 → ZSet 재구축 |
+| 데이터 버그 보정 | 잘못된 점수 | DB만 고치면 됨 | DB가 truth, Redis 폐기·재생성 가능 |
+
+휘발 vs 영속은 표면, 본질은 **역할 분리**:
+- DB = raw data (view/like/sales 누적 카운트)
+- Redis ZSet = derived data (score = 가중합)
+- score는 raw로부터 "유도된 값" — 가중치만 바꿔도 재계산 필요
+
+→ `RankingReconciliation` (Q7 (d)에서 다룰 예정) 이 DB-Redis drift 보정
+
+**[Q7 (b) 종합]**
+| 질문 | 본질 |
+|---|---|
+| b-1 ④ | 별도 테이블 = 읽기 부하 분리 + 여러 view 재사용 |
+| b-2 | LIMIT 20의 거짓말 — 계산식 정렬은 TOP-N 실패 |
+| b-3 | DB = source of truth, Redis = view (역할 분리) |
+
+[글감] "비정규화의 단계 — GROUP BY 제거 vs 정렬 자료구조 보유. product_metrics는 절반의 최적화, ZSet은 완전한 TOP-N"
+[글감] "비정규화 컬럼은 어디에 둘 것인가 — 핵심 테이블에 얹으면 핫 쓰기가 핵심 read를 오염시킨다"
+[글감] "캐시는 view of truth — Redis 영속화로도 RDBMS의 source of truth 자리는 못 가져간다"
+[글감] "raw data와 derived data 분리 — 가중치가 바뀌어도 raw는 그대로, view만 재구축한다"
 
 ---
 
-## ⏸ 학습 일시 중단 (Q7 진행 중)
+### Q7 (c) — 시간 단위별 전략 분기의 본질
 
-이 시점까지 진행 — 다음 재개 시 Q7 (a)/(b)/(c) 답변부터 이어갈 것.
+**[질문]**
+- c-1. Daily 랭킹이 실시간성을 요구하는 이유?
+- c-2. Monthly 랭킹이 실시간성을 요구하지 않는 이유?
+- c-3. 자료구조 선택이 어떻게 갈리는가? (쓰기 비용 vs 읽기 정확도)
 
-남은 영역:
-- Q7 (a)/(b)/(c) 답변 + 흔들기
+**[1차 답변]**
+> c-1 : Daily 랭킹은 판매량과 직결 되기에 비즈니스 관점이나 사용자 경험에서 중요하다
+> c-2 : 월 랭킹은 진짜 판매량과 연관이 있을까 생각해봐야 한다. 단순 좋아요 만으로 순위가 변경 될 수 있기 때문이다
+> c-3 : Daily 는 db에 하면 다량의 조회 때문에 문제가 발생할 수 있다
+
+**[1차 평가]**
+- c-1 ✅ 방향 OK. 보강: 데이터 특성(짧은 윈도우 → +1 영향력 큼) + UX(실시간성 함의)
+- c-2 ⚠ 점수 산정 방식 의문으로 빠짐. 진짜 답은 "+1의 영향력이 시간 범위에 반비례"
+- c-3 ⚠ "조회 다량" 표면적. 진짜 축은 "쓰기 비용 vs 읽기 정확도"
+
+**[정답 제시 (사용자 요청)]**
+
+**c-2 본질 — +1의 영향력은 시간 범위에 반비례**
+
+| 시간 단위 | 평균 누적 점수 | +1 영향력 | 실시간 반영 가치 |
+|---|---|---|---|
+| Daily | ~100 | 1% | 있음 (순위 뒤집힐 수 있음) |
+| Weekly | ~700 | 0.14% | 거의 없음 |
+| Monthly | ~3000 | 0.03% | 노이즈 수준 |
+
+시간 범위 길수록 +1은 노이즈 → 1시간 배치로 충분, "이번 달 TOP 20"은 1초 정확도 의미 없음
+
+**c-3 본질 — 두 시나리오에서 잃는 것**
+
+시나리오 P (Monthly를 ZSet으로):
+- 30일치 누적 ZSet 메모리 부담
+- 가중치 변경 시 30일치 raw 재구축 비용 폭증
+- 0.03% 영향력 반영하려고 매번 ZINCRBY → 오버엔지니어링
+
+시나리오 Q (Daily를 배치로):
+- 사용자 본인 행동 즉시 안 보임 → UX 부자연 (Q4 Optimistic UI와 충돌)
+- 마케팅 급상승 트렌드 노출 타이밍 지연
+- "오늘의 핫" 표현의 실시간성 함의 깨짐
+
+**자료구조 선택의 본질**
+
+| | Daily ZSet | Monthly 배치 |
+|---|---|---|
+| 쓰기 시점 비용 | ZINCRBY 1회 (Redis 분산) | 0 (그 시점엔 안 함) |
+| 갱신 시점 | 매 이벤트 | 정해진 배치 주기 |
+| 정확도 | 100% | 배치 주기만큼 stale |
+| 가중치 변경 비용 | 매번 raw에서 재구축 (값비쌈) | 다음 배치에서 자연스럽게 반영 |
+
+핵심 룰: **"한 건의 변동이 순위에 의미 있는 영향을 주는가?"** 가 실시간 ZSet vs 배치 집계를 가르는 본질적 기준
+
+**[Q7 (c) 종합]**
+| 질문 | 본질 |
+|---|---|
+| c-1 | 짧은 윈도우 + UX 실시간성 함의 |
+| c-2 | +1의 영향력이 시간 범위에 반비례 → 노이즈 수준 |
+| c-3 | 쓰기 시점 갱신 vs 정해진 시점 배치 — 시간 범위 길수록 배치가 자연스러움 |
+
+[글감] "랭킹의 시간 단위가 자료구조를 가른다 — +1의 영향력이 노이즈가 되는 순간 배치로 넘어간다"
+[글감] "Monthly를 ZSet으로 만들지 마라 — 0.03% 영향력에 30일치 메모리와 재구축 비용을 지불할 가치는 없다"
+
+---
+
+## ⏸ 학습 일시 중단 (Q7 (a)~(c) 완료, 2026-05-06)
+
+오늘 진행 분량:
+- Q7 (b) `product_metrics` 테이블의 정체 — 완료 (정답 제시)
+- Q7 (c) 시간 단위별 전략 분기의 본질 — 완료 (정답 제시)
+
+남은 영역 (다음 재개 시):
+- Q7 (a) — Sorted Set 선택의 본질 (건너뛰었음, 추후 보강 가능)
 - Q7 (d) — RankingReconciliation (Redis-DB drift 보정 배치)
 - Q7 (e) — RankingSwap (무중단 갱신, Staging → Active swap 패턴)
 - Q7 (f) — carry over (어제 점수 가중치 이월 Lua script)
