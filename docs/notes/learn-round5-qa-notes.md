@@ -879,3 +879,487 @@ product_metrics 있으면: GROUP BY는 사라지지만 score 계산식은 여전
 - Q7 (f) — carry over (어제 점수 가중치 이월 Lua script)
 - Q8 — 백지 설계 테스트
 
+---
+
+---
+
+## Q7 (d) RankingReconciliation — Redis-DB Drift 보정 배치 (진행 중, 2026-05-07 재개)
+
+### 분석 대상 코드
+
+**[코드 1] `RankingReconciliationProcessor`** (`apps/commerce-batch/.../ranking/RankingReconciliationProcessor.kt`)
+
+```kotlin
+override fun process(item: RankingScore): RankingScore? {
+    val key = RedisKeys.rankingKey(LocalDate.now().format(dateFormatter))
+    val redisScore = masterRedisTemplate.opsForZSet().score(key, item.productId.toString())
+    val dbScore = item.calculateScore()
+
+    if (redisScore != null && kotlin.math.abs(redisScore - dbScore) < 0.001) {
+        return null  // 불일치 없음 → 통과시키지 않음
+    }
+
+    log.info("[RankingReconciliation] 불일치 감지: productId={}, Redis={}, DB={}", ...)
+    return item  // 불일치 → Writer로 전달
+}
+```
+
+**[코드 2] `RankingReconciliationWriter`**
+
+```kotlin
+override fun write(chunk: Chunk<out RankingScore>) {
+    val key = RedisKeys.rankingKey(LocalDate.now().format(dateFormatter))
+    val zSetOps = masterRedisTemplate.opsForZSet()
+
+    chunk.items.forEach { item ->
+        zSetOps.add(key, item.productId.toString(), item.calculateScore())  // ZADD (덮어쓰기)
+    }
+
+    val ttl = masterRedisTemplate.getExpire(key)
+    if (ttl == null || ttl == -1L) {
+        masterRedisTemplate.expire(key, TTL_SECONDS, TimeUnit.SECONDS)  // TTL 재설정
+    }
+}
+```
+
+**[코드 3] `RankingScore.calculateScore`**
+
+```kotlin
+fun calculateScore(): Double {
+    return viewCount * 0.1 + likeCount * 0.2 + salesCount * 0.7
+}
+```
+
+**[코드 4] `RankingReconciliationReader`**
+
+```kotlin
+JdbcPagingItemReader (chunk 100건)
+SELECT pm.product_id, pm.view_count, pm.like_count, pm.sales_count
+FROM product_metrics pm INNER JOIN products p ON pm.product_id = p.id
+WHERE p.deleted_at IS NULL
+ORDER BY pm.product_id ASC
+```
+
+---
+
+### Q7 (d-1) 질문
+
+> Q5/Q6에서 캐시 무효화는 **set이 아니라 delete**가 정답이라고 결론냈음. 멱등성, race 안전.
+>
+> 그런데 이 Reconciliation 배치는:
+> - Processor: DB와 Redis 점수를 **비교**
+> - Writer: 불일치 시 **ZADD로 덮어쓰기 (= set)**
+>
+> **여기서 의문이 두 가지 생긴다:**
+>
+> **(d-1-α)** delete 패턴이 정답이었는데, 왜 이 배치는 set으로 가는가? 단순 무효화 시점에서의 set과 무엇이 다른가?
+>
+> **(d-1-β)** 그리고 더 본질적 질문 — **이 배치가 애초에 왜 필요한가?**
+> 좋아요 +1이 발생하면 ZINCRBY로 즉시 반영되고, DB의 product_metrics도 갱신될 텐데, 둘 사이에 어긋남(drift)이 생기는 시나리오는 무엇인가? 최소 3가지 이상 시나리오를 들어보세요.
+>
+> 힌트: 평소엔 "쓰기 시점 동기화"로 잘 굴러가던 것이 어긋나는 순간이 있다. **단순 race가 아닌 어긋남**의 원인은?
+
+**[답변]**
+> 그냥 답 알려줘 (사용자 요청)
+
+**[정답 제시]**
+
+**(α) 왜 이 set은 안전한가 — Q5/Q6 set과의 본질적 차이**
+
+Q5/Q6에서 set이 위험했던 이유는 "set 자체"가 아니라 **"race로 인한 순서 어긋남"** 때문.
+
+| 시나리오 | 라이터 | 값의 출처 | 순서 보장 | 결과 |
+|---|---|---|---|---|
+| Q5/Q6 set (write-through) | 다중 트랜잭션 | 각자의 read-modify-write | ❌ | 영구 stale |
+| Reconciliation set (ZADD) | 단일 배치 | DB (source of truth) | ✅ chunk 순차 | 수렴 |
+
+Reconciliation set이 안전한 4조건:
+1. Source of Truth 기준 — DB에서 계산된 권위 값
+2. 단일 라이터 — 같은 키에 동시 라이터 없음
+3. 멱등성 — `ZADD score`는 같은 값 여러 번 써도 결과 동일
+4. 수렴 — drift는 일시적, 다음 배치에서 정렬
+
+핵심 룰: **"DB가 truth"라면 view를 그 truth로 덮어쓰는 set은 안전하다.**
+
+**(β) Drift 실제 시나리오 7가지**
+
+| # | 시나리오 | 메커니즘 |
+|---|---|---|
+| 1 | Redis 장애 / 페일오버 | AOF/RDB sync 직전 크래시 → 마지막 명령 손실 |
+| 2 | 네트워크 timeout | DB commit 후 Redis 호출 timeout, retry 없으면 영구 drift |
+| 3 | At-least-once retry 부작용 | retry로 ZINCRBY 두 번 → +0.2 초과분 누적 |
+| 4 | 트랜잭션 boundary 불일치 | DB commit과 Redis 호출이 atomic 아님 |
+| 5 | 가중치(공식) 변경 | `VIEW_WEIGHT` 0.1→0.15 변경 시 전체 재계산 필요 |
+| 6 | 점수 산정 버그 후 보정 | 잘못된 +N 누적 후 코드 수정해도 ZSet에 굳음 |
+| 7 | 관리자 데이터 정정 | 어뷰징 좋아요 DB 삭제 시 Redis 자동 반영 안 됨 |
+
+→ Q7 (b)의 "raw vs derived" 분리가 5번(가중치 변경)에서 직접 작동
+
+[글감] "Reconciliation은 set이 안전한 유일한 패턴 — Source of Truth 기반 단일 라이터 + 멱등 + 수렴"
+[글감] "캐시 drift의 7가지 원인 — 평범한 +1 갱신은 뭐가 어긋날 수 있는가"
+
+---
+
+### Q7 (d-2) 질문 — Processor의 epsilon 비교
+
+```kotlin
+if (redisScore != null && kotlin.math.abs(redisScore - dbScore) < 0.001) {
+    return null
+}
+```
+
+- (α) `==` 등치 비교가 위험한 이유? Double 두 값이 미세하게 달라질 수 있는 메커니즘?
+- (β) 비교로 걸러내는 효과? 그냥 모두 ZADD하면 안 되나?
+- (γ) 0.001은 적절한 임계값인가? 점수 1,270,000 vs 점수 0.7 모두에 같은 임계값?
+
+**[답변]**
+> 답 알려줘 (사용자 요청)
+
+**[정답 제시]**
+
+**(α) `==` 등치 비교가 위험한 이유 — IEEE 754 부동소수점 오차**
+
+1. 십진수가 이진수로 정확히 표현 안 됨
+   - `0.1` (이진수) = `0.0001100110011...` (무한 반복)
+   - 메모리에 근삿값 저장 → `0.1 + 0.2 = 0.30000000000000004`
+
+2. 누적 순서에 따라 결과가 달라짐
+   - Redis: `0.2 + 0.2 + 0.2 + ...` (1000번 누적, ZINCRBY)
+   - DB: `1000 * 0.2` (한 번에 계산, calculateScore)
+   - 수학적으론 같지만 비트 단위로 다를 수 있음
+
+→ "이론상 같은 값"이지만 부동소수점 표현으로는 미세 차이 → `==`는 멀쩡한 항목도 불일치로 판정
+
+**(β) 비교로 걸러내는 효과 — "재기록"이 아니라 "보정"**
+
+| 비교 없이 전부 ZADD | 비교 후 불일치만 ZADD |
+|---|---|
+| ZADD 100만 회 | ZADD 1만 회 (100배 차이) |
+| Redis CPU/네트워크 폭증 | 정상 부하 |
+| 로그 = 정상도 찍힘 → drift 묻힘 | 로그 = 불일치만 → drift 모니터링 신호 |
+
+핵심 룰: **Idempotent하다고 비용까지 idempotent한 건 아니다.**
+Reconciliation 목적의 절반 = 불일치 식별. `[RankingReconciliation] 불일치 감지` 로그 = 운영 알람 신호.
+
+**(γ) 0.001 임계값의 본질적 문제 — 절대값 vs 상대값**
+
+| 상품 | 점수 | 0.001 차이의 비율 |
+|---|---|---|
+| 메가 인기 (1000만/100만/10만) | 1,270,000 | 0.0000000008% — 무의미 |
+| 신상품 (5/1/0) | 0.7 | 0.14% — 의미 있을 수도 |
+
+부동소수점 오차 실제 크기 = 1e-15 ~ 1e-12 수준 → 0.001은 너무 큼 (10⁹배 여유)
+하지만 누적 +0.1/+0.2 drift는 0.001 초과 → 잡힘 → "넉넉한" 절대값 선택
+
+더 정확한 대안: relative epsilon (`abs(diff) < eps * max(|a|, |b|)`)
+이 코드가 절대값 택한 이유:
+- 단순함 (relative는 0 근처 함정)
+- 점수 스케일이 0.001보다 훨씬 큰 상품이 대부분
+- "정확한 비교"보다 "부동소수점 오차로부터 자유"가 목적
+
+**[Q7 (d-2) 종합]**
+
+| 질문 | 본질 |
+|---|---|
+| α | IEEE 754 누적 순서 차이로 `==`는 멀쩡한 값도 불일치로 판정 |
+| β | Reconciliation은 재기록이 아니라 보정 — 비용 + drift 모니터링 |
+| γ | 절대 epsilon = 단순하나 스케일 의존, 상대 epsilon = 0 근처 함정 |
+
+[글감] "Double 점수 비교는 == 금지 — IEEE 754 누적 순서가 다르면 같은 값도 다르다"
+[글감] "Idempotent해도 비용은 idempotent하지 않다 — Reconciliation은 재기록이 아니라 보정"
+[글감] "Epsilon의 함정 — 절대값은 스케일 의존, 상대값은 0 근처 함정"
+
+---
+
+### Q7 (d-3) 질문 — Writer의 TTL 재설정
+
+```kotlin
+chunk.items.forEach { zSetOps.add(key, ...) }  // ZADD
+
+val ttl = masterRedisTemplate.getExpire(key)
+if (ttl == null || ttl == -1L) {
+    masterRedisTemplate.expire(key, TTL_SECONDS, TimeUnit.SECONDS)
+}
+```
+
+- (α) ZADD는 키의 TTL에 어떤 영향을 주나?
+- (β) 이 체크가 없다면 어떤 사고? 시나리오 — 어제 키 만료 후 Reconciliation이 ZADD로 다시 만들면?
+- (γ) `getExpire`+`expire`는 atomic이 아니다. 어떤 race가 발생하나?
+
+**[답변]**
+> 답 알려줘 (사용자 요청)
+
+**[정답 제시]**
+
+**(α) ZADD가 TTL에 미치는 영향**
+
+| 상황 | TTL 결과 |
+|---|---|
+| 기존 키 (TTL 있음) + ZADD | TTL 유지 (ZADD는 TTL 안 건드림) |
+| 기존 키 (TTL 없음) + ZADD | TTL 없음 그대로 |
+| 키 없는 상태 → ZADD로 새로 생성 | TTL 없음 (영구 키) ⚠ |
+
+Redis 일반 룰: 데이터 명령(`ZADD`/`HSET`/`LPUSH`)은 TTL을 보존. 단 새 키 생성 시 기본값은 영구.
+
+**(β) 체크 안 했을 때 사고 — 영구 키 누수**
+
+| 시간 | 결과 |
+|---|---|
+| Day 1 | `ranking:20260506` 영구 키 (100만 엔트리) |
+| Day 30 | 30개 영구 키 = 3000만 엔트리 |
+| Day 365 | 365개 영구 키 = 3.65억 엔트리 |
+
+→ Redis 메모리 폭증 → OOM 또는 maxmemory-policy로 정상 키까지 evict → 캐시 전체 장애
+
+핵심 룰: **TTL은 키 생성과 함께 설정해야 한다.** 안전망은 보조일 뿐, 본 정책이 되면 안 됨.
+
+**(γ) TTL 재설정 race 함정**
+
+시나리오 1 — 의도된 짧은 TTL 덮어씀:
+- t=0: 배치 `getExpire` = -1
+- t=0.001: 다른 프로세스 `EXPIRE 1800`
+- t=0.002: 배치 `expire 2일` → 30분 정책 무시됨
+
+시나리오 2 — 만료 임박 키 못 잡음:
+- `getExpire` = 60 → 코드는 `null/-1`만 체크 → 무시
+- 60초 후 키 만료 → ZADD 데이터도 같이 사라짐
+
+Atomic 대안:
+- `EXPIRE key seconds NX` (Redis 7.0+) — TTL 없을 때만
+- `EXPIRE key seconds GT` (Redis 7.0+) — 더 클 때만
+- Lua script로 GET/SET 묶기
+- `SET key value EX` (ZADD는 EX 없음)
+
+더 나은 설계:
+- 키 생성 모든 경로에 TTL 함께 설정 (`체크 후 설정` 패턴 자체가 안전망일 뿐)
+- chunk마다 체크 = N번 호출 비효율 → afterStep listener에서 한 번만
+- 운영: 별도 데몬이 영구 키 감시 + 알람
+
+**[Q7 (d-3) 종합]**
+
+| 질문 | 본질 |
+|---|---|
+| α | ZADD는 TTL 보존, 새 키엔 TTL 없음 |
+| β | 안전망 없으면 영구 키 누적 → 메모리 누수 → 전체 장애 |
+| γ | `getExpire`+`expire`는 atomic 아님 → `EXPIRE NX/GT` 또는 Lua |
+
+핵심 룰 두 가지:
+1. TTL은 키 생성과 함께 설정 (안전망은 보조)
+2. Redis 단일 명령은 atomic, 시퀀스는 race → 조건부 설정엔 atomic 옵션 또는 Lua
+
+[글감] "TTL 안전망 패턴의 함정 — getExpire+expire는 atomic이 아니다. EXPIRE NX 또는 Lua가 정답"
+[글감] "Redis 영구 키는 어떻게 생기는가 — 데이터 명령은 TTL을 보존하지만, 새 키엔 TTL이 없다"
+
+---
+
+### Q7 (d-4) 질문 — 자정 경계 함정
+
+```kotlin
+// Processor
+val key = RedisKeys.rankingKey(LocalDate.now().format(dateFormatter))
+// Writer (별도 호출)
+val key = RedisKeys.rankingKey(LocalDate.now().format(dateFormatter))
+```
+
+`LocalDate.now()`가 호출 시점마다 평가됨. Reader → Processor → Writer가 자정 경계를 넘는다면?
+
+- (α) 자정 경계 시나리오에서 어떤 잘못된 결과?
+- (β) 더 큰 문제 — 오늘 키 `ranking:20260508`은 ZINCRBY로 차곡차곡 쌓이는 중인데?
+- (γ) 방어 옵션 (A: 시작 시각 캡처 / B: JobParameter 주입 / C: 자정 회피)
+
+**[1차 답변]**
+> α : 중복된 데이터가 나올 수 있다
+> β : 답 알려줘
+> γ : A
+
+**[1차 평가 + 정답 제시]**
+
+**(α) ⚠ "중복"이 아니라 "오염"**
+
+ZADD는 같은 member에 덮어쓰기 → 중복 아님. 정확한 결과는:
+
+| 단계 | 동작 | 키 | 결과 |
+|---|---|---|---|
+| Processor | 어제 키와 비교 | 어제 | 어제 키 만료/carry over → 비교 무의미 |
+| Writer | 오늘 키에 ZADD | 오늘 | 오늘 0~1분 ZINCRBY 점수 손실, 어제 누적 점수로 덮어씀 |
+
+→ 보정한다고 했는데 오히려 drift 악화
+
+**(β) Daily 윈도우 의미 파괴**
+
+핵심: ZSet의 의미는 "시간 윈도우 동안의 누적"인데, 자정 경계 ZADD가 윈도우 정의를 깸
+
+```
+00:00:00 → 오늘 키 비어있거나 carry over만
+00:00:05 → ZINCRBY +0.2 (좋아요)
+00:00:10 → ZINCRBY +0.7 (구매)
+00:00:15 → 누적 0.9
+00:00:30 → 어제 시작된 배치의 chunk #1이 ZADD 1,270,000 덮어씀 ⚠
+00:00:31 → ZINCRBY +0.2 → 1,270,000.2
+```
+
+→ Daily 의미 무너짐. carry over Lua (Q7 (f) 예정)와 직접 충돌
+
+**(γ) ✅ A 부분 정답, B가 본질**
+
+| 항목 | A: 시작 시각 캡처 | B: JobParameter 주입 |
+|---|---|---|
+| 한 Job 내 일관성 | ✅ | ✅ |
+| Job 재실행 시 같은 날짜 | ❌ | ✅ |
+| 운영자 특정 날짜 재실행 | ❌ | ✅ |
+| 테스트 (시간 고정) | ⚠ Clock 주입 필요 | ✅ |
+| Spring Batch 표준 | ❌ | ✅ |
+
+```kotlin
+@JobScope
+class RankingReconciliationProcessor(
+    @Value("#{jobParameters['targetDate']}") private val targetDate: String,
+)
+```
+
+옵션 C(자정 회피)는 우회 — 다른 시간 의존(서머타임, 시계 동기화)은 여전
+
+**핵심 룰: 시간은 코드 안에서 평가하지 말고 외부에서 주입받아라**
+- `LocalDate.now()`는 테스트 어렵고 재현 안 되며 자정 경계에 깨짐
+- Spring Batch: JobParameter, 일반 코드: Clock 주입
+
+**[Q7 (d-4) 종합]**
+
+| 질문 | 답변 평가 | 본질 |
+|---|---|---|
+| α | ⚠ "중복" → 오염 | ZADD 덮어쓰기로 ZINCRBY 점수 손실 |
+| β | (정답 제시) | Daily 윈도우 정의 파괴 |
+| γ | ✅ A 부분 정답 | B가 본질 — 시간 의존성을 외부로 |
+
+[글감] "Daily 랭킹의 자정 경계 — ZINCRBY 누적과 ZADD 덮어쓰기가 만나면 윈도우 의미가 깨진다"
+[글감] "시간을 외부 주입으로 — LocalDate.now()는 코드와 시계를 묶어 자정에 깨진다"
+
+---
+
+## Q7 (d) 종합 — RankingReconciliation 4대 본질
+
+| 질문 | 본질 |
+|---|---|
+| d-1 (set 안전성) | DB = Source of Truth, 단일 라이터, 멱등, 수렴 — 4조건 충족 시 set 안전 |
+| d-1 (drift 원인) | 7가지 — 장애/timeout/retry/트랜잭션 boundary/가중치 변경/버그 보정/관리자 정정 |
+| d-2 (epsilon 비교) | IEEE 754 누적 순서 차이, "재기록 아닌 보정", 절대값 epsilon의 스케일 의존 |
+| d-3 (TTL 재설정) | ZADD는 TTL 보존하지만 새 키엔 TTL 없음, getExpire+expire는 atomic 아님 |
+| d-4 (자정 경계) | LocalDate.now() 분산 호출이 윈도우 깸, JobParameter 외부 주입이 본질 |
+
+**핵심 인사이트**:
+- Reconciliation = "쓰기 시점 동기화"의 안전망 (eventual convergence)
+- "set이 안전한 패턴"은 source of truth + 단일 라이터 + 멱등 + 수렴 조건일 때만
+- 시간/원자성/스케일 같은 "보이지 않는 축"이 코드 곳곳에 함정으로 깔림
+
+---
+
+---
+
+## Q7 (e) RankingSwap — 무중단 갱신 / Staging → Active Swap 패턴
+
+### 분석 대상 코드
+
+**[코드 1] `WeeklyRankingJobConfig` — 2단계 Job 구성**
+
+```kotlin
+.start(weeklyRankingChunkStep(null))   // Step 1: staging 테이블 채우기
+.next(weeklyRankingSwapStep(null))     // Step 2: mv 테이블로 swap
+```
+
+**[코드 2] `RankingStagingWriter`** — Step 1 결과를 staging에 INSERT
+
+```kotlin
+INSERT INTO staging_product_rank_weekly (year_week, product_id, score, rank_num, ..., updated_at)
+VALUES (:periodKey, :productId, :score, 0, ..., :updatedAt)
+ON DUPLICATE KEY UPDATE
+    score = VALUES(score), view_count = VALUES(view_count), ...
+```
+
+**[코드 3] `rankingSwapTasklet`** — Step 2의 핵심 로직
+
+```kotlin
+fun rankingSwapTasklet(...): Tasklet {
+    return Tasklet { _, _ ->
+        // ① 기존 active 데이터 삭제
+        jdbcTemplate.update("DELETE FROM $mvTableName WHERE $periodColumnName = ?", periodKey)
+
+        // ② staging → mv (ROW_NUMBER로 rank_num 계산)
+        jdbcTemplate.update("""
+            INSERT INTO $mvTableName (..., rank_num, ...)
+            SELECT $periodColumnName, product_id, score,
+                   ROW_NUMBER() OVER (ORDER BY score DESC, product_id ASC) AS rank_num,
+                   view_count, like_count, sales_count, updated_at
+            FROM $stagingTableName
+            WHERE $periodColumnName = ?
+        """, periodKey)
+
+        // ③ staging 정리
+        jdbcTemplate.update("DELETE FROM $stagingTableName WHERE $periodColumnName = ?", periodKey)
+        RepeatStatus.FINISHED
+    }
+}
+```
+
+**[테이블 구조]**
+- `mv_product_rank_weekly` = **Active** (조회 전용 Materialized View)
+- `staging_product_rank_weekly` = **Staging** (계산 중인 임시)
+- 사용자 API는 항상 `mv_*` 테이블만 조회
+
+---
+
+### Q7 (e-1) 질문 — 왜 Staging과 Active를 분리했나?
+
+코드는 두 테이블을 두고:
+1. Step 1에서 staging 테이블에 새 데이터 채움
+2. Step 2에서 mv 테이블로 일괄 swap
+
+**의문**: 왜 이렇게 복잡하게? 그냥 mv 테이블을 직접 UPDATE/INSERT하면 안 되나?
+
+### 시나리오 비교
+
+**옵션 X (직접 갱신, 단순)**:
+```
+사용자 SELECT → mv 테이블 (현재 1주차 데이터, 100만 row)
+배치 시작 → mv 테이블에서 row by row UPDATE/INSERT (10분 소요)
+배치 진행 중 → 사용자 SELECT → mv (절반은 갱신, 절반은 어제 것)
+```
+
+**옵션 Y (Staging → Swap)**:
+```
+사용자 SELECT → mv 테이블 (현재 1주차 데이터)
+배치 진행 → staging에 차곡차곡 (10분, 사용자는 안 봄)
+Swap 순간 (수 초) → mv 일괄 교체
+사용자 SELECT → mv (옛 데이터 OR 새 데이터, 부분 상태 안 보임)
+```
+
+### 질문 (e-1-α)
+**옵션 X(직접 갱신)의 문제는 무엇인가?** 사용자 경험 / 데이터 일관성 / 운영 측면에서 각각.
+
+### 질문 (e-1-β)
+**옵션 Y(Swap)의 본질**은 한 줄로 표현하면? 무엇을 분리한 것인가?
+
+힌트: Q4의 ④ Materialized View 패턴이 여기서 어떻게 구현되었는가? "쓰기"와 "읽기"를 분리한 건 같은데, 추가로 무엇을 분리한 것인가?
+
+### 질문 (e-1-γ)
+**그런데 Daily는 swap을 안 쓰고 ZINCRBY 실시간 누적**으로 갑니다. 왜 Daily는 swap 패턴이 부적절한가? Weekly/Monthly는 swap이 자연스러운가? Q7 (c)의 결론과 연결지어 설명.
+
+답하시거나 "답 알려줘" 하시면 됩니다.
+
+---
+
+## ⏸ 학습 일시 중단 (Q7 (d) 완료, Q7 (e-1) 질문 작성, 2026-05-07)
+
+오늘 진행 분량:
+- Q7 (d-1) set 안전성 + drift 7시나리오 — 완료 (정답 제시)
+- Q7 (d-2) Epsilon 비교의 본질 — 완료 (정답 제시)
+- Q7 (d-3) TTL 재설정의 함정 — 완료 (정답 제시)
+- Q7 (d-4) 자정 경계 함정 — 완료 (1차 답변 + 정답 제시)
+- Q7 (e) RankingSwap 도입 + (e-1) 질문 작성 (답변 대기)
+
+남은 영역 (다음 재개 시):
+- Q7 (e-1) 답변부터 시작 — Staging/Active 분리, Daily vs Weekly/Monthly 갈래
+- Q7 (e-2~) Tasklet 3단계 (DELETE+INSERT+DELETE), 트랜잭션 격리, 동시 조회 영향
+- Q7 (a) — Sorted Set 선택의 본질 (건너뛰었음, 추후 보강 가능)
+- Q7 (f) — carry over (어제 점수 가중치 이월 Lua script)
+- Q8 — 백지 설계 테스트
+
