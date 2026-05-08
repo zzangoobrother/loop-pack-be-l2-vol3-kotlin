@@ -1343,23 +1343,480 @@ Swap 순간 (수 초) → mv 일괄 교체
 ### 질문 (e-1-γ)
 **그런데 Daily는 swap을 안 쓰고 ZINCRBY 실시간 누적**으로 갑니다. 왜 Daily는 swap 패턴이 부적절한가? Weekly/Monthly는 swap이 자연스러운가? Q7 (c)의 결론과 연결지어 설명.
 
-답하시거나 "답 알려줘" 하시면 됩니다.
+**[1차 답변]**
+> 답 알려줘
+
+**[정답 제시]**
+
+**(α) 옵션 X(직접 갱신)의 3측면 문제**
+
+| 측면 | 문제 |
+|---|---|
+| 사용자 경험 | 갱신 중 부분 상태 노출, ROW_NUMBER 매기는 중 중복/빈 rank, 페이지네이션 깨짐, UPDATE 락이 SELECT 막음 |
+| 데이터 일관성 | "트랜잭션 작게" vs "읽기 일관성" 정면 충돌. 100만 row 한 트랜잭션 = 장기 트랜잭션 / 쪼개면 부분 상태 / rank_num은 전체 한 번에 계산돼야 의미 있음 |
+| 운영 | 중간 실패 시 추적 어려움, 옛 데이터 덮어써 롤백 불가, 재실행 멱등성 보장 어려움, 모니터링 지표 출렁 |
+
+**(β) Swap 패턴의 본질 — 한 줄**
+
+> **"계산 중인 상태"와 "사용자가 볼 수 있는 상태"를 분리한다.**
+
+| 패턴 | 분리한 것 |
+|---|---|
+| ④ Materialized View | 쓰기 경로(트랜잭션) ↔ 읽기 경로(미리 계산된 스냅샷) |
+| Staging→Swap | 위에 더해 — 계산 중인 임시 스냅샷 ↔ 공식 스냅샷 |
+
+다른 이름: **Atomic Replacement** / **DB 버전 Blue-Green Pattern** / **in-place → out-of-place 빌드 + 일괄 교체**
+
+핵심 효과: **불완전한 상태가 사용자에게 절대 노출되지 않는다 (atomic visibility)**
+
+**(γ) Daily vs Weekly/Monthly — 시간 단위가 결정하는 갱신 패러다임**
+
+Daily에 swap 부적절:
+- 1시간 단위 swap → 1시간 전 스냅샷 = "실시간"이 아님
+- 1분 단위 swap → 너무 자주 100만 row 재계산 = 비용 폭증, 의미 없음
+- "실시간 누적"과 "주기적 일괄 계산"은 패러다임이 다름
+
+Weekly/Monthly는 swap 자연스러움:
+- 본질이 "기간 종합 점수 = 안정성"
+- 데이터 소스 분산 (좋아요/구매/조회 여러 테이블 집계)
+- 한 번 계산하면 거의 안 바뀜 → 일 1회로 충분
+- 한 번에 정확히 계산해 일괄 교체 = 정합성 보장에 유리
+
+| 시간 단위 | 데이터 본질 | 갱신 전략 | 위치 |
+|---|---|---|---|
+| Daily | 실시간성 > 정확성 | ZINCRBY 누적 (in-place) | Redis ZSet |
+| Weekly | 정확성 > 실시간성 | Staging → Swap (out-of-place) | MySQL mv 테이블 |
+| Monthly | 정확성 > 실시간성 | Staging → Swap (out-of-place) | MySQL mv 테이블 |
+
+**핵심 인사이트**: 데이터의 본질이 다르면 인프라 패턴, 저장소, 갱신 모델까지 모두 달라진다. 같은 "랭킹"이라는 단어 안에 두 개의 다른 시스템이 들어있는 것.
+
+**[Q7 (e-1) 종합]**
+
+| 질문 | 본질 |
+|---|---|
+| α | in-place 갱신은 UX/일관성/운영 3측면 모두에서 깨짐 — 특히 "전체가 한 번에"여야 의미 있는 데이터(rank_num)는 치명적 |
+| β | Materialized View 위에 한 단계 더 분리 — 계산 중인 상태 vs 공식 상태. atomic visibility 확보 |
+| γ | 데이터의 시간적 본질(실시간성/안정성)이 갱신 모델(누적/Swap)을 결정 |
+
+[글감] "Materialized View vs Swap — 한 단계 더 분리한 것은 '계산 중인 상태'와 '공식 상태'"
+[글감] "in-place vs out-of-place 갱신 — DB 버전 Blue-Green과 atomic visibility"
+[글감] "왜 Daily는 누적, Weekly는 Swap인가 — 시간 단위가 결정하는 갱신 패러다임 분기"
 
 ---
 
-## ⏸ 학습 일시 중단 (Q7 (d) 완료, Q7 (e-1) 질문 작성, 2026-05-07)
+## Q7 (e-2) Swap Tasklet 3단계의 함정 — 트랜잭션 경계 / 격리 / atomic swap 패턴
 
-오늘 진행 분량:
-- Q7 (d-1) set 안전성 + drift 7시나리오 — 완료 (정답 제시)
-- Q7 (d-2) Epsilon 비교의 본질 — 완료 (정답 제시)
-- Q7 (d-3) TTL 재설정의 함정 — 완료 (정답 제시)
-- Q7 (d-4) 자정 경계 함정 — 완료 (1차 답변 + 정답 제시)
-- Q7 (e) RankingSwap 도입 + (e-1) 질문 작성 (답변 대기)
+### 분석 대상 (재방문)
 
-남은 영역 (다음 재개 시):
-- Q7 (e-1) 답변부터 시작 — Staging/Active 분리, Daily vs Weekly/Monthly 갈래
-- Q7 (e-2~) Tasklet 3단계 (DELETE+INSERT+DELETE), 트랜잭션 격리, 동시 조회 영향
-- Q7 (a) — Sorted Set 선택의 본질 (건너뛰었음, 추후 보강 가능)
-- Q7 (f) — carry over (어제 점수 가중치 이월 Lua script)
-- Q8 — 백지 설계 테스트
+```kotlin
+fun rankingSwapTasklet(...): Tasklet {
+    return Tasklet { _, _ ->
+        // ① DELETE FROM mv WHERE periodKey = ?
+        // ② INSERT INTO mv SELECT ROW_NUMBER() ... FROM staging WHERE periodKey = ?
+        // ③ DELETE FROM staging WHERE periodKey = ?
+        RepeatStatus.FINISHED
+    }
+}
+```
+
+### 질문
+- (α) ①②③은 한 트랜잭션? 세 트랜잭션? Spring Batch Tasklet의 기본 동작은?
+- (β) 만약 다른 트랜잭션이라면 사용자 SELECT가 보는 상태?
+- (γ) 진짜 atomic swap 패턴 3가지 (한 트랜잭션 / RENAME TABLE / VIEW) 비교
+
+**[1차 답변]**
+> 답 알려줘
+
+**[정답 제시]**
+
+**(α) Spring Batch Tasklet은 한 트랜잭션**
+
+- TaskletStep은 각 Tasklet 호출을 PlatformTransactionManager로 감쌈
+- `RepeatStatus.FINISHED` 리턴까지 한 트랜잭션 = ①②③은 **하나의 트랜잭션**
+- 실패 시 자동 롤백
+
+하지만 "한 트랜잭션 = atomic visibility"는 자동 보장이 아니다:
+- MySQL InnoDB 기본 = REPEATABLE READ → 다른 SELECT는 자기 트랜잭션 시작 스냅샷(MVCC) 봄
+- swap commit 전 시작된 SELECT는 옛 데이터, commit 후는 새 데이터 → **REPEATABLE READ에서는 부분 상태 노출 안 됨** ✅
+- `READ COMMITTED`였다면 commit된 변경을 즉시 봄 → 부분 상태 위험
+
+진짜 함정 = **장기 트랜잭션**:
+- 100만 row DELETE+INSERT 한 트랜잭션 → undo log 폭증, 복제 지연, X-lock 점유
+
+**(β) 만약 ①②③가 다른 트랜잭션이라면**
+
+| 시점 | mv 상태 | 사용자 SELECT |
+|---|---|---|
+| ① 직후 ② 전 | 비어있음 | **빈 결과** = "랭킹 사라졌다" 사고 |
+| ② 진행 중 | rank 1~50만 INSERT | **부분 결과**, ROW_NUMBER 구멍 |
+| ② 후 ③ 전 | 정상 | 정상 (안전) |
+
+**(γ) 진짜 atomic swap 3패턴**
+
+| 옵션 | atomic 단위 | 락 비용 | 적합 규모 |
+|---|---|---|---|
+| A 한 트랜잭션 (@Transactional) | 트랜잭션 commit | 행 X-lock 분 단위 | 작은~중간 |
+| B RENAME TABLE | 메타데이터 락 | MDL 수 ms | 큰 규모 |
+| C VIEW + CREATE OR REPLACE | 메타데이터 락 | MDL 수 ms | 큰 규모 + 추상화 |
+
+옵션 B 예시:
+```sql
+RENAME TABLE
+  mv_product_rank_weekly TO mv_tmp,
+  staging_product_rank_weekly TO mv_product_rank_weekly,
+  mv_tmp TO staging_product_rank_weekly;
+```
+
+옵션 C 예시:
+```sql
+CREATE OR REPLACE VIEW mv_view AS SELECT * FROM mv_b;
+```
+
+**현재 코드는 옵션 A**:
+- TaskletStep이 한 트랜잭션으로 감쌈, `@Transactional` 명시 없음 (기본 동작 의존 → 가독성 ↓)
+- **영리한 포인트**: `WHERE year_week = ?`로 한 주차만 DELETE → 락 범위 좁힘 → 장기 트랜잭션 위험 완화
+
+**[Q7 (e-2) 종합]**
+
+| 질문 | 본질 |
+|---|---|
+| α | TaskletStep은 한 트랜잭션. 단 atomic visibility는 격리 수준이 결정. 장기 트랜잭션 비용은 별개 |
+| β | 다른 트랜잭션이면 빈 결과/부분 결과 노출. UX 치명 |
+| γ | 진짜 atomic = "변경의 가시성 단위"를 작게 (commit / RENAME / VIEW). 규모가 패턴을 결정 |
+
+핵심 인사이트:
+- "트랜잭션에 묶었으니 atomic"은 절반의 진실 — commit 시점 가시성 ≠ 실행 중 락 비용
+- 진짜 atomic은 "단위를 작게" — DDL 레벨 swap이 가장 안전
+- 현재 코드는 WHERE 범위 제한으로 옵션 A의 한계를 회피한 영리한 설계
+
+[글감] "Tasklet과 트랜잭션 — Spring Batch 자동 감싸기 + 격리 수준은 여전히 개발자 책임"
+[글감] "Atomic swap의 3가지 격: 트랜잭션 commit / RENAME TABLE / VIEW — 데이터 규모가 패턴을 결정"
+[글감] "WHERE 조건으로 swap 범위 좁히기 — 주 단위 격리가 장기 트랜잭션 위험을 막는다"
+
+---
+
+## Q7 (f) carry over Lua Script — 어제 점수 가중치 이월의 atomicity
+
+### 분석 대상 코드
+
+```lua
+-- KEYS[1]=source(어제), KEYS[2]=target(오늘), ARGV[1]=decay, ARGV[2]=ttl
+if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end  -- ①
+local entries = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')  -- ②
+for i = 1, #entries, 2 do
+    redis.call('ZADD', KEYS[2], tonumber(entries[i+1]) * decay, entries[i])  -- ③
+end
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]))  -- ④
+return #entries / 2
+```
+
+### 질문 (f-1) 왜 Lua인가?
+
+**[1차 답변]**
+> redis를 단계별로 호출하면 중간에 다른 request가 들어와서 데이터 값에 변경을 줄 수 있고, 원자성을 위해 lua를 사용한다
+
+**[1차 평가]** ✅ 핵심 잡음. 구체 시나리오 보강 필요
+
+**[악마의 변호인]** ZADD는 덮어쓰기 → 두 배치 동시 실행해도 결과 같음. 그럼 race 정말 문제?
+
+**진짜 위험 시나리오** — 사용자 ZINCRBY 점수 손실:
+```
+t=0     : ZRANGE source = [상품A:100]
+t=0.001 : 사용자 ZINCRBY target 상품A +0.7 → target = {상품A: 0.7}
+t=0.002 : carry over ZADD target 상품A 50 → target = {상품A: 50} ⚠ 0.7 손실
+```
+
+→ ZADD가 ZINCRBY 점수를 **덮어쓴다.** 이건 (f-3)의 EXISTS 함정으로 직결.
+
+### 질문 (f-2) Lua atomicity 본질
+
+**[1차 답변]**
+> RedisTemplate는 각 명령어에 atomic 하다 그래서 여러 명령어 사이에 다른 작업이 끼어들면 데이터 변경이 발생할 수 있다. lua는 lua 명령어가 실행 완료될 때까지 atomic 하기때문에 묶는다
+
+**[1차 평가]** ✅ 정확. atomic vs isolated 보강
+
+| 개념 | 의미 |
+|---|---|
+| Atomic | 모두 성공/실패 (부분 실행 없음) |
+| Isolated | 실행 중 다른 명령이 끼어들지 못함 |
+
+Redis Lua = atomic + isolated 둘 다 (single-threaded). DB 트랜잭션은 isolated가 격리 수준 의존.
+
+Lua 보장 못하는 것:
+- Durability — Redis fsync 정책에 의존
+- Lua 안 에러 시 부분 실행 가능 (Redis 7.0 이전)
+- 스크립트 길면 Redis 전체 block → 짧게 유지
+
+MULTI/EXEC vs Lua: MULTI/EXEC는 분기 불가, Lua는 if/loop 가능. 조건부 atomic은 Lua.
+
+### 질문 (f-3) EXISTS 체크의 의도
+
+**[1차 답변]**
+> 답 알려줘
+
+**[정답 제시]**
+
+**EXISTS 없이 그냥 ZADD하면?**
+- 두 배치 같은 점수로 ZADD → 결과 같음 (비효율)
+- 사용자 ZINCRBY 먼저 끼면 → ZADD가 덮어써 점수 손실
+
+**EXISTS 체크가 있어도 race?**
+- Lua 밖에서 EXISTS+ZADD 분리하면 race (둘 다 EXISTS=0 통과)
+- Lua 안에 묶으면 race-free → **Lua atomic이 EXISTS 체크에 의미 부여**
+
+**EXISTS 체크의 진짜 함정** — 자정 직후 ZINCRBY 시나리오:
+```
+t=00:00:01 : ZINCRBY target +0.7 → target = {상품A: 0.7} (키 생성)
+t=00:00:30 : carry over: EXISTS target = 1 → skip ⚠
+→ carry over 누락, 어제 1등 상품 사라짐
+```
+
+**핵심 문제**: **"carry over 완료 마커"와 "데이터 키"가 같다**
+- 데이터 키에 ZINCRBY 쌓이면 "이미 carry over 됨"으로 오인
+- carry over가 사용자 트래픽보다 먼저여야만 작동
+
+**더 강한 보장**:
+
+| 옵션 | 효과 |
+|---|---|
+| 별도 done flag (`carryover:done:{date}`) | 데이터 키와 독립, ZINCRBY 키 만들어도 carry over 진행 |
+| ZADD → ZINCRBY 변경 | 사용자 점수 보존 + 합산. 단 두 번 실행 시 2배 → done flag 필수 |
+| Spring Batch JobInstance 멱등성 | 같은 JobParameter 한 번만. Layer 1 보호 |
+
+**진짜 안전한 패턴** = 분리된 done flag + ZINCRBY 조합:
+```lua
+if redis.call('EXISTS', flag_key) == 1 then return 0 end
+local entries = redis.call('ZRANGE', source, 0, -1, 'WITHSCORES')
+for i = 1, #entries, 2 do
+    redis.call('ZINCRBY', target, tonumber(entries[i+1]) * decay, entries[i])
+end
+redis.call('EXPIRE', target, ttl)
+redis.call('SET', flag_key, '1', 'EX', ttl)
+```
+
+**[Q7 (f) 종합]**
+
+| 질문 | 본질 |
+|---|---|
+| f-1 | 단계별 호출 race + ZADD가 ZINCRBY 덮어쓰기 (점수 손실) |
+| f-2 | atomic + isolated 보장. MULTI/EXEC와 달리 분기 가능. Redis 단일 스레드 활용 |
+| f-3 | Lua atomic이 EXISTS 체크에 의미. 단 데이터 키 = 멱등 마커는 race. done flag + ZINCRBY가 진짜 안전 |
+
+[글감] "ZADD vs ZINCRBY — carry over에서 한 글자 차이가 사용자 점수를 살리거나 죽인다"
+[글감] "멱등성 마커와 데이터를 분리하라 — 데이터 존재 여부로 완료를 판단하면 race에 깨진다"
+[글감] "Lua atomic이 EXISTS 체크에 의미를 부여한다 — 분리된 호출은 EXISTS의 보장이 사라진다"
+
+---
+
+## Q8 백지 설계 테스트 — 6축 종합 (모범 답안 제시)
+
+**[1차 답변]**
+> 그냥 다 해줘 (백지 설계 직접 수행 X → 모범 답안 제시 후 자가 점검 권고)
+
+### ① 인덱스 설계
+
+원칙:
+1. 등호 → 범위 순서
+2. 카디널리티 높은 컬럼 먼저
+3. 정렬 컬럼은 마지막 + 같은 방향
+
+예시 인덱스:
+- `(brand_id, created_at DESC)` — 브랜드별 최신
+- `(category_id, like_count DESC)` — 카테고리별 인기
+- `(brand_id, category_id, created_at DESC)` — 둘 다 필터
+
+Trade-off: 인덱스 N개 → 쓰기 N배. 자주 변하는 컬럼(like_count)을 인덱스 키로 쓰면 갱신 비용 큼 → 캐시/MV로 우회.
+
+함정: 카디널리티 = "쿼리 결과 선택성"이지 "값 종류 수"가 아님 (gender=M 99%는 옵티마이저 무시).
+
+### ② 비정규화
+
+결정: like_count, view_count를 상품 테이블에 비정규화 (별도 테이블이면 매번 JOIN/COUNT 불가능).
+
+갱신 동시성:
+
+| 옵션 | 상황 | 한계 |
+|---|---|---|
+| SQL atomic +1 | 일반 트래픽 | 핫 row 락 경합 |
+| 비관적 락 | 강한 일관성 | 핫 row 치명 |
+| 낙관적 락 | 충돌 적을 때 | retry 폭증 |
+| Redis 카운터 + 주기 flush | 핫 상품 | eventual consistency |
+| Kafka 이벤트 + 배치 | 분석 분리 | 인프라 복잡 |
+
+선택: 일반은 SQL atomic +1, 인기 상품은 Redis ZINCRBY로 hot path 분리.
+
+### ③ Redis 캐시
+
+대상: 단건(1h) / 카테고리 첫 페이지(5~10m) / 검색 결과 첫 N페이지
+
+전략 — Cache-Aside가 일반 권장:
+- READ: cache → miss → DB → cache 저장 → 반환
+- WRITE: DB 갱신 → cache invalidate
+
+Cache Stampede 방어 4가지:
+1. Lock 기반 (SETNX, 첫 미스만 DB 조회)
+2. PER (만료 전 확률적 갱신)
+3. Stale-While-Revalidate (만료 데이터 + 백그라운드 갱신)
+4. TTL jitter (랜덤 오프셋)
+
+Hot Key: Caffeine 로컬 + Redis 다층 / 키 샤딩.
+
+### ④ Daily 랭킹
+
+자료구조 — Sorted Set:
+
+| 후보 | 정렬 | 갱신 | atomic 누적 |
+|---|---|---|---|
+| List | X | O(N) | X |
+| Hash | X | O(1) get | X |
+| **ZSet** | native O(log N) | O(log N) | **ZINCRBY atomic** |
+
+키: `ranking:daily:20260508`, TTL 2일 (carry over 위해)
+
+carry over: 어제 × decay → 오늘. **별도 done flag** + **ZINCRBY** (ZADD 아님!) 로 사용자 점수 보존.
+
+자정 경계: `LocalDate.now()` → JobParameter 외부 주입.
+
+### ⑤ Weekly/Monthly 랭킹
+
+Daily와 패러다임 다름:
+
+| 시간 | 본질 | 갱신 모델 | 저장소 |
+|---|---|---|---|
+| Daily | 실시간성 > 정확성 | ZINCRBY 누적 | Redis ZSet |
+| Weekly/Monthly | 정확성 > 실시간성 | Staging→Swap | MySQL mv |
+
+Tasklet 3단계 (DELETE → INSERT(ROW_NUMBER) → DELETE staging), 한 트랜잭션 + REPEATABLE READ → 부분 상태 차단. WHERE year_week=? 로 락 범위 좁힘.
+
+대규모 시 격상: RENAME TABLE 또는 VIEW + CREATE OR REPLACE.
+
+### ⑥ Reconciliation
+
+set vs incrby — 4조건 (source of truth + 단일 라이터 + 멱등 + 수렴) 충족 시 set 안전.
+
+Epsilon 비교 (불필요 쓰기 차단):
+- IEEE 754 누적 순서 차이
+- 절대값 아닌 상대값 (스케일 의존)
+- "같으면 재기록 X"
+
+시간 의존성: `LocalDate.now()` → JobParameter 외부 주입 (`@Value("#{jobParameters['targetDate']}")`).
+
+TTL 안전망: ZADD는 TTL 보존, 새 키엔 TTL 없음 → 영구 키 누수. 키 생성 시점에 TTL 함께 설정. atomic은 `EXPIRE NX/GT` 또는 Lua.
+
+---
+
+## 구현 준비도 판정
+
+**판정**: **부분 보완 필요 (자가 점검 권고)**
+
+- 백지 설계를 직접 수행하지 않고 정답 제시 요청 → 진짜 조립 가능 여부 미검증
+- 6축 모범 답안 제공 후 자가 점검 체크리스트 부여
+
+자가 점검 체크리스트:
+
+| 축 | 핵심 질문 | 자가 평가 |
+|---|---|---|
+| ① 인덱스 | 등호/범위/카디널리티 우선순위 + Trade-off | ☐ |
+| ② 비정규화 | hot row 동시성을 어떻게 분리하는가? | ☐ |
+| ③ 캐시 | Cache Stampede 4가지 방어 패턴? | ☐ |
+| ④ Daily | Sorted Set 선택 정당성 + carry over의 함정 | ☐ |
+| ⑤ Weekly | Materialized View vs Staging→Swap 차이 | ☐ |
+| ⑥ Reconciliation | set 안전 4조건 + 시간 의존성 회피 | ☐ |
+
+---
+
+## 전체 학습 종료 — Round 5 종합
+
+### 핵심 개념 정리 (학습한 개념 간 관계)
+
+```
+[읽기 병목의 본질]
+   ├── 트래픽 95:5 (양적 압도)
+   ├── 다양한 조건/조인 (구조적)
+   └── UX 직결
+
+[3대 무기 + 대가]
+   ├── 인덱스   → 시간(쓰기 지연) + 공간 (B+Tree, 카디널리티 = 선택성)
+   ├── 캐시     → 정합성(stale) + 인프라 비용 + Stampede 위험
+   └── 비정규화 → 쓰기 시점 동기화 책임 (hot row 동시성 = Round 4)
+
+[비정규화 → Materialized View → Staging→Swap]
+   ├── 비정규화 = 같은 테이블에 카운터
+   ├── Materialized View = 쓰기/읽기 경로 분리
+   └── Staging→Swap = "계산 중" / "공식" 분리 (atomic visibility)
+
+[시간 단위가 결정하는 갱신 패러다임]
+   ├── Daily: 실시간성 → ZINCRBY in-place (Redis ZSet)
+   └── Weekly/Monthly: 정확성 → Staging→Swap out-of-place (MySQL mv)
+
+[Reconciliation 4대 본질]
+   ├── set 안전 4조건 (source of truth + 단일 라이터 + 멱등 + 수렴)
+   ├── Epsilon (IEEE 754, 상대값, 재기록 차단)
+   ├── TTL 안전망 (ZADD 보존, 새 키 영구, atomic EXPIRE NX/GT)
+   └── 시간 외부 주입 (LocalDate.now() → JobParameter)
+
+[Lua atomic의 본질]
+   ├── atomic + isolated (single-threaded)
+   ├── 분기 가능 (vs MULTI/EXEC)
+   └── EXISTS 체크는 Lua 안에서만 의미
+```
+
+### 블로그 글감 모음 (학습 중 도출)
+
+**Round 5 메인**
+1. "INSERT만 하니까 안 느릴 것"이라는 위험한 직관 — 쓰기 비용은 락 외에도 디스크 I/O / WAL / 인덱스 / 버퍼 풀
+2. 카디널리티는 값의 종류 수가 아니라 "쿼리 결과의 선택성" — A 사이트 99% gender=M의 함정
+3. 복합 인덱스의 왼쪽 우선 + 등호 → 범위 → 정렬 — B+Tree가 강제하는 컬럼 순서
+4. "범위 조건이 여러 개면 정렬은 깨진다" — 인덱스 정렬 활용의 미묘한 함정
+
+**Round 5 캐시**
+5. Cache-Aside vs Write-Through vs Write-Behind — 일관성과 성능의 4가지 다른 위치
+6. Cache Stampede 4가지 방어 — Lock, PER, SWR, TTL jitter
+7. Redis 영구 키는 어떻게 생기는가 — 데이터 명령은 TTL 보존하지만 새 키엔 TTL 없음
+8. TTL 안전망 패턴의 함정 — getExpire+expire는 atomic이 아니다, EXPIRE NX 또는 Lua가 정답
+
+**Round 5 랭킹**
+9. Materialized View vs Swap — 한 단계 더 분리한 것은 "계산 중인 상태"와 "공식 상태"
+10. in-place vs out-of-place 갱신 — DB 버전 Blue-Green과 atomic visibility
+11. 왜 Daily는 누적, Weekly는 Swap인가 — 시간 단위가 결정하는 갱신 패러다임 분기
+12. Atomic swap 3가지 격: 트랜잭션 commit / RENAME TABLE / VIEW — 데이터 규모가 패턴을 결정
+13. WHERE 조건으로 swap 범위 좁히기 — 주 단위 격리가 장기 트랜잭션 위험을 막는다
+14. Daily 랭킹의 자정 경계 — ZINCRBY 누적과 ZADD 덮어쓰기가 만나면 윈도우 의미가 깨진다
+15. 시간을 외부 주입으로 — LocalDate.now()는 코드와 시계를 묶어 자정에 깨진다
+
+**Round 5 Reconciliation / Lua**
+16. set은 가능한가? — Source of Truth + 단일 라이터 + 멱등 + 수렴, 4조건의 안전망
+17. Epsilon 비교의 본질 — 절대값이 아니라 "재기록 차단"의 도구
+18. ZADD vs ZINCRBY — carry over에서 한 글자 차이가 사용자 점수를 살리거나 죽인다
+19. 멱등성 마커와 데이터를 분리하라 — 데이터 존재 여부로 완료를 판단하면 race에 깨진다
+20. Lua atomic이 EXISTS 체크에 의미를 부여한다 — 분리된 호출은 EXISTS의 보장이 사라진다
+21. Tasklet과 트랜잭션 — Spring Batch 자동 감싸기 + 격리 수준은 여전히 개발자 책임
+
+### 구현 연결 포인트 (실제 구현 시 참고)
+
+1. **인덱스 적용 시**: `WHERE 등호` + `ORDER BY 정렬` 패턴부터 인덱스 → 쓰기 비용 N배 고려
+2. **캐시 도입 시**: TTL을 키 생성과 함께 설정 (안전망 패턴은 보조), Stampede 방어 패턴 1개는 필수
+3. **랭킹 구현 시**: Daily는 ZSet + ZINCRBY, Weekly는 mv + Staging→Swap, 시간 의존성은 JobParameter
+4. **carry over Lua 구현 시**: done flag 별도 키, ZADD가 아니라 ZINCRBY (사용자 점수 보존)
+5. **Reconciliation 구현 시**: set 가능한지 4조건 점검, Epsilon은 상대값, 시간은 외부 주입
+6. **트랜잭션 경계**: TaskletStep 한 트랜잭션 + REPEATABLE READ로 atomic visibility, 락 범위 WHERE로 좁힘
+
+### 다음 단계 안내
+
+**구현 준비 점검**:
+- 위 6축 자가 점검 체크리스트로 머릿속에서 다시 조립해보기
+- 약한 영역 발견 시 해당 섹션 다시 읽기
+
+**구현 진입 옵션**:
+- 플랜 모드(`/plan`)로 Round 5 과제 구체 설계 작성
+- 구현 스킬(`/red`, `/green`, `/refactor`) 활용
+- 또는 PRD 기반(`/plan`) → TDD 사이클(`/go`)로 진행
+
+**다음 라운드 연결**:
+- Round 6 학습 시작 시 이 노트의 핵심 개념 정리 섹션을 다시 읽고 시작
+- 특히 "비정규화 → MV → Swap" 흐름과 "시간 단위별 갱신 패러다임"은 이후 라운드에서도 반복 등장 예상
+
+---
+
+## ✅ 학습 완료 (Q8 백지 설계 모범 답안 제시 + 자가 점검 권고, 2026-05-08)
 
